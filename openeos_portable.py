@@ -295,6 +295,9 @@ def apply_titlebar_theme(root: tk.Tk, dark: bool) -> None:
         pass
 
 
+
+
+
 def format_display_date(raw: str | None) -> str:
     """Преобразует машинный формат EXIF 'YYYY:MM:DD HH:MM:SS' в человеческий 'DD.MM.YYYY, HH:MM:SS'."""
     if not raw or not isinstance(raw, str):
@@ -505,6 +508,11 @@ class OpenEOSApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+
         self.theme_name = detect_system_theme()
         self.update_theme_attrs()
 
@@ -512,19 +520,8 @@ class OpenEOSApp:
         self.root.title(f"{APP_TITLE} — проверка показания счётчика")
         self.root.resizable(False, False)
 
-        # Выбор наиболее качественного шрифта
-        try:
-            import tkinter.font as tkfont
-            avail = set(tkfont.families())
-            for candidate in (
-                "Segoe UI Variable Text", "Segoe UI",
-                "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Arial"
-            ):
-                if candidate in avail:
-                    self.FONT_FAMILY = candidate
-                    break
-        except Exception:
-            pass
+        # Нативный шрифт Windows Fluent (Segoe UI всегда доступен без сканирования реестра)
+        self.FONT_FAMILY = "Segoe UI"
 
         # Строго фиксированный размер окна под интерфейс
         self.setup_window_geometry(860, 520)
@@ -560,7 +557,12 @@ class OpenEOSApp:
         self.configure_styles()
         self.create_interface()
 
-        # Применяем нативный стиль заголовка Windows 10/11
+        # Полная компоновка и отрисовка в памяти до показа окна
+        apply_titlebar_theme(self.root, self.theme_name == "dark")
+        self.root.update_idletasks()
+
+        # Чистое проявление окна без белых вспышек и морганий
+        self.root.deiconify()
         apply_titlebar_theme(self.root, self.theme_name == "dark")
 
     def style_tooltip_button(self, widget: tk.Label) -> None:
@@ -1395,7 +1397,6 @@ class OpenEOSApp:
         self.batch_total = 0
         self.batch_processed = 0
         self.batch_started_at = time.monotonic()
-
         self.batch_cancelled = False
         self.set_busy(True, "batch")
         self.set_progress(0, 0)
@@ -1967,6 +1968,10 @@ class OpenEOSApp:
 
 if __name__ == "__main__":
     root = ROOT_CLASS()
+    try:
+        root.withdraw()
+    except Exception:
+        pass
     theme = detect_system_theme()
     bg = THEMES[theme]["BG"]
     root.configure(bg=bg)
