@@ -240,11 +240,17 @@ def detect_system_theme() -> str:
             winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
         )
-        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        for param in ("AppsUseLightTheme", "SystemUsesLightTheme"):
+            try:
+                val, _ = winreg.QueryValueEx(key, param)
+                winreg.CloseKey(key)
+                return "dark" if val == 0 else "light"
+            except FileNotFoundError:
+                continue
         winreg.CloseKey(key)
-        return "light" if val == 1 else "dark"
     except Exception:
-        return "light"
+        pass
+    return "dark"
 
 
 def apply_titlebar_theme(root: tk.Tk, dark: bool) -> None:
@@ -564,7 +570,14 @@ class OpenEOSApp:
 
         # Применяем нативный стиль заголовка Windows 10/11 и принудительно перерисовываем все виджеты
         apply_titlebar_theme(self.root, self.theme_name == "dark")
+        self.root.update_idletasks()
         force_window_repaint(self.root)
+
+        # Полностью готовое и отрисованное окно проявляется без белых морганий
+        try:
+            self.root.attributes("-alpha", 1.0)
+        except Exception:
+            pass
 
     def style_tooltip_button(self, widget: tk.Label) -> None:
         """Стилизует иконку справки (?) и привязывает интерактивный тултип."""
@@ -679,7 +692,6 @@ class OpenEOSApp:
         # Обновление заголовка Windows и принудительная отрисовка
         apply_titlebar_theme(self.root, self.theme_name == "dark")
         force_window_repaint(self.root)
-
         # Восстановление данных Single Tab
         self.counter_label.config(text=last_shutter_text)
         if "Готово" in last_status_text or "Проверено" in last_status_text:
@@ -1394,7 +1406,6 @@ class OpenEOSApp:
             return
         if not self.check_exiftool(show_message=True):
             return
-
         self.batch_cancel_event = threading.Event()
         self.batch_results = []
         self.batch_metadata = {}
@@ -1972,6 +1983,12 @@ class OpenEOSApp:
 
 if __name__ == "__main__":
     root = ROOT_CLASS()
+    try:
+        # Скрываем неинициализированный холст через прозрачность alpha=0
+        # (в отличие от withdraw(), это сохраняет валидность буферов GDI)
+        root.attributes("-alpha", 0.0)
+    except Exception:
+        pass
     theme = detect_system_theme()
     bg = THEMES[theme]["BG"]
     root.configure(bg=bg)
