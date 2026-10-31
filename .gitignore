@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build artifacts
+build/
+dist/
+build_spec/
+*.spec
+
+# Virtual Environment
+build-env/
+venv/
+env/
+ENV/
+
+# Temporary / OS generated files
+*.tmp
+*.log
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# User camera test files (CRITICAL: Do NOT commit user RAW or PCAP files)
+*.cr2
+*.CR2
+*.cr3
+*.CR3
+*.nef
+*.NEF
+*.arw
+*.ARW
+*.raf
+*.RAF
+*.dng
+*.DNG
+*.heic
+*.HEIC
+*.hif
+*.HIF
+*.pcap
+*.pcapng
+*.csv
+
+# Local tools directory (ExifTool engine files)
+# Note: Distribution instructions are in packaging/README.md
+exiftool_files/
+exiftool.exe
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+*.swp
+*.swo
