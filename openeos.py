@@ -20,7 +20,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "OpenEOS"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 
 BATCH_CHUNK_SIZE = 50
 TABLE_CHUNK_SIZE = 150

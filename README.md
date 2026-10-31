@@ -1,6 +1,6 @@
 # OpenEOS — Open Shutter Count Desktop Utility
 
-[![Version](https://img.shields.io/badge/version-v0.4.1-blue.svg)](https://github.com/PointOpenEnter/OpenEOS-RD/releases)
+[![Version](https://img.shields.io/badge/version-v0.4.2-blue.svg)](https://github.com/PointOpenEnter/OpenEOS-RD/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)]()
 [![Privacy](https://img.shields.io/badge/privacy-100%25%20Offline-brightgreen.svg)]()

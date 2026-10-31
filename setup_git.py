@@ -71,13 +71,13 @@ def main() -> int:
     print("\n[2/4] Проверка изменений и создание коммита...")
     status = subprocess.run([GIT_CMD, "status", "--porcelain"], cwd=PROJECT_DIR, capture_output=True, text=True).stdout.strip()
     if status:
-        run_git(["commit", "-m", "perf: Remove system font enumeration and optimize cold startup latency"])
+        run_git(["commit", "-m", "release: Bump version to v0.4.2 (Zero startup flash, optimized launch latency, legacy v0.3.1)"])
     else:
         print("[OK] Все изменения уже зафиксированы в Git.")
 
-    # 5. Обновление релизных тегов v0.4.1 и v0.3.1
-    print("\n[3/4] Установка релизных тегов v0.4.1 и v0.3.1...")
-    run_git(["tag", "-f", "-a", "v0.4.1", "-m", "OpenEOS Release v0.4.1 (Stable Fluent UI, Camera Icon, Fixed Geometry)"])
+    # 5. Обновление релизных тегов
+    print("\n[3/4] Установка релизных тегов...")
+    run_git(["tag", "-f", "-a", "v0.4.2", "-m", "OpenEOS Release v0.4.2 (Zero Startup Flash, Optimized Latency, Legacy v0.3.1 Archive)"])
     check_v031 = subprocess.run([GIT_CMD, "tag", "-l", "v0.3.1"], cwd=PROJECT_DIR, capture_output=True, text=True).stdout.strip()
     if not check_v031:
         run_git(["tag", "-a", "v0.3.1", "-m", "OpenEOS Release v0.3.1 (Legacy light-theme baseline)"])
