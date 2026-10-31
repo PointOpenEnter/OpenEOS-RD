@@ -76,4 +76,4 @@ python -m PyInstaller ^
 
 ## 📦 Публикация релизов
 * Готовые `.exe` файлы **не коммитятся в Git-репозиторий**.
-* Они прикрепляются вручную к соответствующему [GitHub Release](https://github.com/berr3374-lgtm/OpenEOS-RD/releases), снабженному Git-тегом версии (`v0.4.1`).
+* Они прикрепляются вручную к соответствующему [GitHub Release](https://github.com/PointOpenEnter/OpenEOS-RD/releases), снабженному Git-тегом версии (`v0.4.1`).

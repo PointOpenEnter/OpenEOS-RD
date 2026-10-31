@@ -1,6 +1,6 @@
 # OpenEOS — Open Shutter Count Desktop Utility
 
-[![Version](https://img.shields.io/badge/version-v0.4.1-blue.svg)](https://github.com/berr3374-lgtm/OpenEOS-RD/releases)
+[![Version](https://img.shields.io/badge/version-v0.4.1-blue.svg)](https://github.com/PointOpenEnter/OpenEOS-RD/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)]()
 [![Privacy](https://img.shields.io/badge/privacy-100%25%20Offline-brightgreen.svg)]()
@@ -47,7 +47,7 @@
 ## 🚀 Быстрый старт
 
 ### Вариант 1: Готовый исполняемый файл (EXE)
-1. Скачайте последний релиз `OpenEOS.exe` со страницы [Releases](https://github.com/berr3374-lgtm/OpenEOS-RD/releases).
+1. Скачайте последний релиз `OpenEOS.exe` со страницы [Releases](https://github.com/PointOpenEnter/OpenEOS-RD/releases).
 2. Запустите файл на Windows 10/11 x64.
 3. Перетащите ваш RAW-файл в область загрузки или нажмите **«Выбрать файл…»**.
 
@@ -56,7 +56,7 @@
 
 ```bash
 # Клонирование репозитория
-git clone https://github.com/berr3374-lgtm/OpenEOS-RD.git
+git clone https://github.com/PointOpenEnter/OpenEOS-RD.git
 cd OpenEOS-RD
 
 # Установка зависимостей интерфейса
