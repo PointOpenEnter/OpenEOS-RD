@@ -265,12 +265,15 @@ def apply_titlebar_theme(root: tk.Tk, dark: bool) -> None:
             pass
         if not hwnd:
             hwnd = root.winfo_id()
-            parent = ctypes.windll.user32.GetParent(hwnd)
-            if parent:
-                hwnd = parent
-
         if not hwnd:
             return
+
+        try:
+            root_hwnd = ctypes.windll.user32.GetAncestor(ctypes.c_void_p(hwnd), ctypes.c_uint(2))
+            if root_hwnd:
+                hwnd = root_hwnd
+        except Exception:
+            pass
 
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         val = ctypes.c_int(1 if dark else 0)
@@ -292,15 +295,7 @@ def apply_titlebar_theme(root: tk.Tk, dark: bool) -> None:
         pass
 
 
-def force_window_repaint(root: tk.Tk) -> None:
-    """Принудительно инвалидирует и перерисовывает все области окна Win32."""
-    try:
-        root.update_idletasks()
-        hwnd = root.winfo_id()
-        ctypes.windll.user32.InvalidateRect(ctypes.c_void_p(hwnd), None, True)
-        ctypes.windll.user32.UpdateWindow(ctypes.c_void_p(hwnd))
-    except Exception:
-        pass
+
 
 
 def format_display_date(raw: str | None) -> str:
@@ -568,16 +563,8 @@ class OpenEOSApp:
         self.configure_styles()
         self.create_interface()
 
-        # Применяем нативный стиль заголовка Windows 10/11 и принудительно перерисовываем все виджеты
+        # Применяем нативный стиль заголовка Windows 10/11
         apply_titlebar_theme(self.root, self.theme_name == "dark")
-        self.root.update_idletasks()
-        force_window_repaint(self.root)
-
-        # Полностью готовое и отрисованное окно проявляется без белых морганий
-        try:
-            self.root.attributes("-alpha", 1.0)
-        except Exception:
-            pass
 
     def style_tooltip_button(self, widget: tk.Label) -> None:
         """Стилизует иконку справки (?) и привязывает интерактивный тултип."""
@@ -689,9 +676,8 @@ class OpenEOSApp:
         self.create_interface()
         self.switch_tab(active_tab, initial=True)
 
-        # Обновление заголовка Windows и принудительная отрисовка
+        # Обновление заголовка Windows
         apply_titlebar_theme(self.root, self.theme_name == "dark")
-        force_window_repaint(self.root)
         # Восстановление данных Single Tab
         self.counter_label.config(text=last_shutter_text)
         if "Готово" in last_status_text or "Проверено" in last_status_text:
@@ -1983,12 +1969,6 @@ class OpenEOSApp:
 
 if __name__ == "__main__":
     root = ROOT_CLASS()
-    try:
-        # Скрываем неинициализированный холст через прозрачность alpha=0
-        # (в отличие от withdraw(), это сохраняет валидность буферов GDI)
-        root.attributes("-alpha", 0.0)
-    except Exception:
-        pass
     theme = detect_system_theme()
     bg = THEMES[theme]["BG"]
     root.configure(bg=bg)

@@ -64,31 +64,45 @@ def main() -> int:
     subprocess.run([GIT_CMD, "config", "user.email", "PointOpenEnter@users.noreply.github.com"], cwd=PROJECT_DIR)
 
     # 3. Добавление всех файлов по структуре
-    print("\n[1/3] Индексация файлов (включая архив legacy/v0.3.1)...")
+    print("\n[1/4] Индексация файлов...")
     run_git(["add", "."])
 
-    # 4. Фиксация коммита и релизных тегов v0.4.1 и v0.3.1
-    print("\n[2/3] Создание коммита и релизных тегов...")
-    run_git(["commit", "-m", "feat: Add v0.3.1 legacy archive and eliminate theme startup blink"])
+    # 4. Фиксация коммита (если есть изменения)
+    print("\n[2/4] Проверка изменений и создание коммита...")
+    status = subprocess.run([GIT_CMD, "status", "--porcelain"], cwd=PROJECT_DIR, capture_output=True, text=True).stdout.strip()
+    if status:
+        run_git(["commit", "-m", "fix: Polish startup and resolve Git tag synchronization"])
+    else:
+        print("[OK] Все изменения уже зафиксированы в Git.")
+
+    # 5. Обновление релизных тегов v0.4.1 и v0.3.1
+    print("\n[3/4] Установка релизных тегов v0.4.1 и v0.3.1...")
     run_git(["tag", "-f", "-a", "v0.4.1", "-m", "OpenEOS Release v0.4.1 (Stable Fluent UI, Camera Icon, Fixed Geometry)"])
-    run_git(["tag", "-a", "v0.3.1", "-m", "OpenEOS Release v0.3.1 (Legacy light-theme baseline)"])
+    check_v031 = subprocess.run([GIT_CMD, "tag", "-l", "v0.3.1"], cwd=PROJECT_DIR, capture_output=True, text=True).stdout.strip()
+    if not check_v031:
+        run_git(["tag", "-a", "v0.3.1", "-m", "OpenEOS Release v0.3.1 (Legacy light-theme baseline)"])
 
-    # 5. Отправка в GitHub (ветка main и все теги)
-    print("\n[3/3] Отправка в GitHub (ветка main и теги v0.4.1, v0.3.1)...")
-    push_code = run_git(["push", "-u", "origin", "main", "--tags"])
+    # 6. Отправка ветки main и тегов с флагом --force
+    print("\n[4/4] Отправка в GitHub (ветка main и теги)...")
+    push_main = run_git(["push", "-u", "origin", "main"])
+    push_tags = run_git(["push", "origin", "--tags", "--force"])
 
-    if push_code == 0:
+    if push_main == 0 and push_tags == 0:
         print("\n" + "=" * 60)
-        print("[УСПЕХ] Все изменения, архив v0.3.1 и теги успешно отправлены в GitHub!")
-        print(f"Страница репозитория: {REPO_URL[:-4]}")
+        print("[УСПЕХ] Синхронизация завершена без единой ошибки!")
+        print("=" * 60)
+        print(f"• Главная страница:      {REPO_URL[:-4]}")
+        print(f"• Архив v0.3.1 (папка):  {REPO_URL[:-4]}/tree/main/legacy/v0.3.1")
+        print(f"• Список тегов и версий: {REPO_URL[:-4]}/tags")
         print("=" * 60)
     else:
         print("\n[ИНФО] Повторная отправка с авто-синхронизацией...")
         run_git(["pull", "origin", "main", "--rebase"])
-        push_code = run_git(["push", "-u", "origin", "main", "--tags"])
+        run_git(["push", "-u", "origin", "main"])
+        run_git(["push", "origin", "--tags", "--force"])
 
     input("\nНажмите Enter для завершения...")
-    return push_code
+    return 0
 
 
 if __name__ == "__main__":
