@@ -71,7 +71,7 @@ def main() -> int:
     print("\n[2/4] Проверка изменений и создание коммита...")
     status = subprocess.run([GIT_CMD, "status", "--porcelain"], cwd=PROJECT_DIR, capture_output=True, text=True).stdout.strip()
     if status:
-        run_git(["commit", "-m", "release: Bump version to v0.4.2 (Zero startup flash, optimized launch latency, legacy v0.3.1)"])
+        run_git(["commit", "-m", "release: Bump version to v0.4.2 (Zero startup flash, optimized latency, 500k R6m2 rating, legacy archive)"])
     else:
         print("[OK] Все изменения уже зафиксированы в Git.")
 
