@@ -1,0 +1,182 @@
+"""
+OpenEOS: альтернативный метод чтения счётчика через штатную заводскую
+процедуру камеры CamInfo_Debug (встроенный интерпретатор Canon Basic),
+без служебного USB PTP канала (0x9052/0x9053) и без авторизации 0x905C.
+
+Источники, независимо подтверждающие метод:
+  - https://github.com/fedoroff-aa/shutter-check-canon
+    (список проверенных моделей включает EOS R6 Mark II и EOS R10)
+  - форум Magic Lantern, ветка "Canon Basic scripting (DIGIC 8, DIGIC X models)"
+    (участник kitor называет те же свойства PROP_MECHA_COUNTER / PROP_RELEASE_COUNTER)
+
+ВАЖНО:
+  - EOS R6 Mark III в списке подтверждённых моделей НЕТ.
+  - CamInfo_Debug — штатная, предусмотренная Canon диагностическая функция
+    (используется сервисными центрами), а не взлом или изменение прошивки.
+  - OpenEOS в этом модуле НИЧЕГО не пишет в камеру и не форматирует карту.
+    Подготовка карты (формат FAT + метка загрузочного сектора "SCRIPT")
+    должна быть выполнена заранее сторонней, давно используемой сообществом
+    утилитой EOScard (см. EOSCARD_INFO_URL) — OpenEOS только кладёт два
+    текстовых файла в уже подготовленный корень карты и потом читает XML,
+    который камера сама записывает на карту.
+"""
+from __future__ import annotations
+
+import ctypes
+import re
+import string
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+EXTEND_M_CONTENT = (
+    "private sub Initialize()\n"
+    "System.Create()\n"
+    "CamInfo_Debug(1)\n"
+    "end sub\n"
+)
+
+SCRIPT_REQ_CONTENT = "for DC_scriptdisk\n"
+
+EOSCARD_INFO_URL = "https://chdk.fandom.com/wiki/EOScard"
+
+CONFIRMED_MODELS = (
+    "EOS R", "EOS Ra", "EOS RP", "EOS R3", "EOS R5", "EOS R5 C", "EOS R5 Mark II",
+    "EOS R6", "EOS R6 Mark II", "EOS R7", "EOS R8", "EOS R10",
+)
+
+KNOWN_ERROR_CODES = {
+    "E01": "ошибка связи с объективом / контактами",
+    "E02": "ошибка связи с объективом",
+    "E20": "системная ошибка (разное)",
+    "E70": "системная ошибка: сбой чтения/записи памяти",
+}
+
+
+class RemovableDrive:
+    def __init__(self, letter: str, label: str, fstype: str, total_bytes: int, free_bytes: int):
+        self.letter = letter  # например "E:\\"
+        self.label = label
+        self.fstype = fstype
+        self.total_bytes = total_bytes
+        self.free_bytes = free_bytes
+
+    @property
+    def is_fat(self) -> bool:
+        return (self.fstype or "").upper() in ("FAT", "FAT32")
+
+    @property
+    def size_gb(self) -> float:
+        return round(self.total_bytes / (1024 ** 3), 1) if self.total_bytes else 0.0
+
+    def display(self) -> str:
+        label = self.label or "без метки"
+        return f"{self.letter}   {label}  ·  {self.fstype}  ·  {self.size_gb} ГБ"
+
+
+def list_removable_drives() -> list[RemovableDrive]:
+    """
+    Только СЪЁМНЫЕ диски (карты памяти через кардридер, флешки).
+    Жёсткие и системные диски намеренно исключены, чтобы пользователь
+    не мог случайно выбрать не ту букву диска.
+    """
+    DRIVE_REMOVABLE = 2
+    kernel32 = ctypes.windll.kernel32
+    drives: list[RemovableDrive] = []
+
+    bitmask = kernel32.GetLogicalDrives()
+    for i, letter in enumerate(string.ascii_uppercase):
+        if not (bitmask & (1 << i)):
+            continue
+        root = f"{letter}:\\"
+        try:
+            if kernel32.GetDriveTypeW(root) != DRIVE_REMOVABLE:
+                continue
+
+            vol_buf = ctypes.create_unicode_buffer(261)
+            fs_buf = ctypes.create_unicode_buffer(261)
+            ok = kernel32.GetVolumeInformationW(root, vol_buf, 261, None, None, None, fs_buf, 261)
+            if not ok:
+                continue  # дисковод есть, но карты нет
+
+            free_b = ctypes.c_ulonglong(0)
+            total_b = ctypes.c_ulonglong(0)
+            kernel32.GetDiskFreeSpaceExW(root, ctypes.byref(free_b), ctypes.byref(total_b), None)
+
+            drives.append(RemovableDrive(root, vol_buf.value, fs_buf.value or "?", total_b.value, free_b.value))
+        except Exception:
+            continue
+    return drives
+
+
+def copy_script_files(drive: RemovableDrive) -> tuple[bool, str]:
+    """Копирует extend.m и script.req в корень уже подготовленной карты."""
+    if not drive.is_fat:
+        return False, (
+            f"Карта отформатирована как {drive.fstype}, а не FAT/FAT32.\n"
+            "Сначала подготовьте карту через EOScard (формат FAT + метка SCRIPT), "
+            f"см. {EOSCARD_INFO_URL}"
+        )
+    try:
+        root = Path(drive.letter)
+        (root / "extend.m").write_text(EXTEND_M_CONTENT, encoding="ascii")
+        (root / "script.req").write_text(SCRIPT_REQ_CONTENT, encoding="ascii")
+        return True, "Файлы extend.m и script.req записаны на карту."
+    except Exception as ex:
+        return False, f"Не удалось записать файлы на карту: {ex}"
+
+
+def find_cam_info_xml(drive: RemovableDrive) -> Path | None:
+    root = Path(drive.letter)
+    direct = root / "CAM_INFO.XML"
+    if direct.exists():
+        return direct
+    try:
+        for p in root.rglob("CAM_INFO.XML"):
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def parse_cam_info_xml(path: Path) -> dict:
+    """
+    Формат подтверждён сообществом (shutter-check-canon). Отсутствующие или
+    нераспознанные поля остаются None/пустыми — без подстановки придуманных значений.
+    """
+    result = {
+        "total_shutter": None,
+        "total_running_time": None,
+        "errors": [],
+        "raw_path": str(path),
+        "parse_error": None,
+    }
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        root = ET.fromstring(text)
+    except Exception as ex:
+        result["parse_error"] = str(ex)
+        return result
+
+    def find_text(tag: str):
+        el = root.find(f".//{tag}")
+        return el.text.strip() if (el is not None and el.text) else None
+
+    ts = find_text("TotalShutter")
+    if ts and ts.isdigit():
+        result["total_shutter"] = int(ts)
+
+    result["total_running_time"] = find_text("TotalRunningTime")
+
+    err_list_el = root.find(".//ErrorList")
+    if err_list_el is not None:
+        for err_el in list(err_list_el):
+            raw = (err_el.text or err_el.tag or "").strip()
+            m = re.search(r"(E\d{2})", raw)
+            code = m.group(1) if m else raw
+            result["errors"].append({
+                "code": code,
+                "name": KNOWN_ERROR_CODES.get(code, "расшифровка кода неизвестна"),
+                "raw": raw,
+            })
+
+    return result

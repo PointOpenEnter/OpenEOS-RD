@@ -50,6 +50,23 @@ $RECYCLE.BIN/
 exiftool_files/
 exiftool.exe
 
+# Private hardware service / diagnostic experimental files (OpenEOS Service)
+openeos_service.py
+canon_ptp.py
+canon_live_usb.*
+app_icon_service.*
+test_*.*
+inspect_*.*
+parse_*.*
+run_*.bat
+build_service.bat
+clean.bat
+*.R6Mk2_AdjData
+*.AdjData
+*.bin
+*.txt
+USB_TRAFFIC_ANALYSIS.md
+
 # IDE / Editor configuration
 .idea/
 .vscode/

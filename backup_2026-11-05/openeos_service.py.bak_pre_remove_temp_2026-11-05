@@ -1,0 +1,2731 @@
+"""
+OpenEOS — диагностика фотокамер Canon (EXIF + прямое USB-подключение).
+Версия: v0.5.0.
+Включает чтение файлов (RAW/CR3/NEF/ARW), пакетный анализ и модуль прямого опроса Canon USB.
+"""
+from __future__ import annotations
+
+import csv
+import ctypes
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    import create_icons
+    create_icons.generate_all_icons()
+except Exception:
+    pass
+
+from canon_ptp import CanonPTPManager, CanonCameraDevice
+import cbasic_card
+
+APP_TITLE = "OpenEOS"
+APP_VERSION = "0.5.0"
+
+BATCH_CHUNK_SIZE = 50
+TABLE_CHUNK_SIZE = 150
+
+SUPPORTED_EXTENSIONS = (
+    ".cr2", ".cr3", ".dng", ".jpg", ".jpeg",
+    ".heic", ".hif", ".nef", ".arw", ".raf", ".pef",
+)
+
+SUPPORTED_FILETYPES = [
+    ("Все форматы OpenEOS", "*.CR2 *.CR3 *.DNG *.JPG *.JPEG *.HEIC *.HIF *.NEF *.ARW *.RAF *.PEF"),
+    ("Canon RAW (CR2, CR3)", "*.CR2 *.CR3"),
+    ("Nikon RAW (NEF)", "*.NEF"),
+    ("Sony RAW (ARW)", "*.ARW"),
+    ("Fujifilm RAW (RAF)", "*.RAF"),
+    ("DNG Digital Negative", "*.DNG"),
+    ("JPEG / HEIF", "*.JPG *.JPEG *.HEIC *.HIF"),
+    ("Все файлы", "*.*"),
+]
+
+SUPPORTED_FORMATS_LABEL = (
+    "CR2  ·  CR3  ·  DNG  ·  JPG/JPEG  ·  HEIC  ·  HIF  ·  NEF  ·  ARW  ·  RAF  ·  PEF"
+)
+
+CAMERA_SHUTTER_RATINGS = {
+    "r1": 500_000,
+    "r3": 500_000,
+    "r5 mark ii": 500_000,
+    "r5 ii": 500_000,
+    "r5m2": 500_000,
+    "r5": 500_000,
+    "r6 mark ii": 500_000,
+    "r6 ii": 500_000,
+    "r6m2": 500_000,
+    "r6": 300_000,
+    "r7": 200_000,
+    "eos r": 200_000,
+    "ra": 200_000,
+    "r8": 100_000,
+    "r10": 100_000,
+    "r50": 100_000,
+    "r100": 100_000,
+    "rp": 100_000,
+    "1d x mark iii": 500_000,
+    "1d x mark ii": 400_000,
+    "1d x": 400_000,
+    "5d mark iv": 150_000,
+    "5d mark iii": 150_000,
+    "5d mark ii": 150_000,
+    "5ds": 150_000,
+    "6d mark ii": 100_000,
+    "6d": 100_000,
+    "7d mark ii": 200_000,
+    "7d": 150_000,
+    "90d": 120_000,
+    "80d": 100_000,
+    "70d": 100_000,
+    "ilce-1": 500_000,
+    "ilce-9": 500_000,
+    "a1": 500_000,
+    "a9": 500_000,
+    "ilce-7rm5": 500_000,
+    "ilce-7rm4": 500_000,
+    "ilce-7rm3": 500_000,
+    "a7r v": 500_000,
+    "a7rv": 500_000,
+    "a7r iv": 500_000,
+    "a7riv": 500_000,
+    "a7r iii": 500_000,
+    "a7s iii": 500_000,
+    "ilce-7m4": 200_000,
+    "ilce-7m3": 200_000,
+    "a7 iv": 200_000,
+    "a7m4": 200_000,
+    "a7 iii": 200_000,
+    "a7m3": 200_000,
+    "a7c ii": 200_000,
+    "a7c": 200_000,
+    "a6700": 200_000,
+    "a6600": 200_000,
+    "a6400": 200_000,
+    "a6000": 100_000,
+    "z 9": 500_000,
+    "z9": 500_000,
+    "z 8": 500_000,
+    "z8": 500_000,
+    "z 7": 200_000,
+    "z7": 200_000,
+    "z 6": 200_000,
+    "z6": 200_000,
+    "z 5": 200_000,
+    "z5": 200_000,
+    "z f": 200_000,
+    "zf": 200_000,
+    "z50": 100_000,
+    "d850": 200_000,
+    "d810": 200_000,
+    "d780": 150_000,
+    "d750": 150_000,
+    "d500": 200_000,
+    "d6": 400_000,
+    "d5": 400_000,
+    "d4": 400_000,
+    "x-h2": 500_000,
+    "x-h2s": 500_000,
+    "x-t5": 300_000,
+    "x-t4": 300_000,
+    "x-t3": 150_000,
+    "x-s20": 100_000,
+    "x-s10": 100_000,
+    "gfx 100": 150_000,
+    "gfx 50": 150_000,
+}
+
+
+def get_camera_rating(model_str: str | None) -> int | None:
+    if not model_str:
+        return None
+    m = model_str.lower().replace("-", " ").replace("_", " ").strip()
+    m = re.sub(r"\s+", " ", m)
+    for key in sorted(CAMERA_SHUTTER_RATINGS.keys(), key=len, reverse=True):
+        pattern = rf"\b{re.escape(key)}\b"
+        if re.search(pattern, m):
+            return CAMERA_SHUTTER_RATINGS[key]
+    return None
+
+
+def init_exiftool() -> tuple[list[str], dict[str, str], str | None]:
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    local_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    dev_dir = r"C:\Tools\ExifTool"
+
+    search_dirs = [base_dir, local_dir, dev_dir]
+    env = os.environ.copy()
+    cmd_prefix: list[str] = []
+    exif_cwd: str | None = None
+
+    for candidate_dir in search_dirs:
+        if not candidate_dir or not os.path.isdir(candidate_dir):
+            continue
+
+        exiftool_files = os.path.join(candidate_dir, "exiftool_files")
+        lib_dir = os.path.join(exiftool_files, "lib")
+        perl_exe = os.path.join(exiftool_files, "perl.exe")
+        exiftool_pl = os.path.join(exiftool_files, "exiftool.pl")
+        exiftool_exe = os.path.join(candidate_dir, "exiftool.exe")
+
+        if os.path.isfile(perl_exe) and os.path.isfile(exiftool_pl) and os.path.isdir(lib_dir):
+            cmd_prefix = [perl_exe, "-I", lib_dir, exiftool_pl]
+            exif_cwd = candidate_dir
+            env["PERL5LIB"] = lib_dir
+            env["PERLLIB"] = lib_dir
+            break
+
+        if os.path.isfile(exiftool_exe):
+            cmd_prefix = [exiftool_exe]
+            exif_cwd = candidate_dir
+            if os.path.isdir(lib_dir):
+                env["PERL5LIB"] = lib_dir
+                env["PERLLIB"] = lib_dir
+            break
+
+    if not cmd_prefix:
+        cmd_prefix = [r"C:\Tools\ExifTool\exiftool.exe"]
+        exif_cwd = dev_dir
+
+    return cmd_prefix, env, exif_cwd
+
+
+EXIFTOOL_CMD, EXIFTOOL_ENV, EXIFTOOL_CWD = init_exiftool()
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    DND_AVAILABLE = True
+    ROOT_CLASS = TkinterDnD.Tk
+except ImportError:
+    DND_FILES = None
+    DND_AVAILABLE = False
+    ROOT_CLASS = tk.Tk
+
+
+def detect_system_theme() -> str:
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        for param in ("AppsUseLightTheme", "SystemUsesLightTheme"):
+            try:
+                val, _ = winreg.QueryValueEx(key, param)
+                winreg.CloseKey(key)
+                return "dark" if val == 0 else "light"
+            except FileNotFoundError:
+                continue
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    return "dark"
+
+
+def apply_titlebar_theme(root: tk.Tk, dark: bool) -> None:
+    try:
+        hwnd = None
+        try:
+            frame = root.wm_frame()
+            if frame:
+                hwnd = int(frame, 16)
+        except Exception:
+            pass
+        if not hwnd:
+            hwnd = root.winfo_id()
+        if not hwnd:
+            return
+
+        try:
+            root_hwnd = ctypes.windll.user32.GetAncestor(ctypes.c_void_p(hwnd), ctypes.c_uint(2))
+            if root_hwnd:
+                hwnd = root_hwnd
+        except Exception:
+            pass
+
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        val = ctypes.c_int(1 if dark else 0)
+        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            ctypes.c_uint(DWMWA_USE_IMMERSIVE_DARK_MODE),
+            ctypes.byref(val),
+            ctypes.sizeof(val)
+        )
+        if res != 0:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_uint(19),
+                ctypes.byref(val),
+                ctypes.sizeof(val)
+            )
+    except Exception:
+        pass
+
+
+def format_display_date(raw: str | None) -> str:
+    if not raw or not isinstance(raw, str):
+        return "—"
+    val = raw.strip()
+    parts = val.split(" ")
+    if len(parts) == 2 and parts[0].count(":") == 2:
+        ymd = parts[0].split(":")
+        if len(ymd) == 3 and len(ymd[0]) == 4:
+            return f"{ymd[2]}.{ymd[1]}.{ymd[0]}, {parts[1]}"
+    return val
+
+
+THEMES = {
+    "light": {
+        "BG": "#F9F9F9",
+        "CARD": "#FFFFFF",
+        "TEXT": "#1B1B1B",
+        "MUTED": "#6E6E6E",
+        "SUBTLE": "#AEAEB2",
+        "BORDER": "#E0E0E0",
+        "ACCENT": "#0067C0",
+        "ACCENT_HOVER": "#005A9E",
+        "ACCENT_BG": "#F4F9FD",
+        "ACCENT_BORDER": "#C5D9E8",
+        "GRAY_BTN": "#EAEAEA",
+        "GRAY_BTN_HOVER": "#DFDFDF",
+        "GRAY_BTN_FG": "#1B1B1B",
+        "STATUS_BG_IDLE": "#EFEFF4",
+        "STATUS_FG_IDLE": "#6E6E6E",
+        "STATUS_BG_OK": "#EAF7EE",
+        "STATUS_FG_OK": "#1E7B34",
+        "STATUS_BG_WARN": "#FFF4CE",
+        "STATUS_FG_WARN": "#9D5D00",
+        "STATUS_BG_ERR": "#FDE7E9",
+        "STATUS_FG_ERR": "#C42B1C",
+        "RED_BTN_HOVER": "#F8C9CB",
+        "TAB_BG": "#F9F9F9",
+        "TAB_SEL_BG": "#EFEFEF",
+        "TAB_SEL_FG": "#000000",
+        "PROG_BG": "#E5E5EA",
+        "BADGE_BG": "#EAEAEA",
+        "BADGE_FG": "#6E6E6E",
+        "ROW_ODD": "#FFFFFF",
+        "ROW_EVEN": "#F8F9FA",
+        "SCROLL_TROUGH": "#F0F0F0",
+        "SCROLL_THUMB": "#CDCDCD",
+    },
+    "dark": {
+        "BG": "#1F1F1F",
+        "CARD": "#282828",
+        "TEXT": "#FFFFFF",
+        "MUTED": "#9E9E9E",
+        "SUBTLE": "#6E6E6E",
+        "BORDER": "#383838",
+        "ACCENT": "#0067C0",
+        "ACCENT_HOVER": "#1177D7",
+        "ACCENT_BG": "#1E2A35",
+        "ACCENT_BORDER": "#2E4456",
+        "GRAY_BTN": "#333333",
+        "GRAY_BTN_HOVER": "#404040",
+        "GRAY_BTN_FG": "#FFFFFF",
+        "STATUS_BG_IDLE": "#2F2F2F",
+        "STATUS_FG_IDLE": "#A0A0A0",
+        "STATUS_BG_OK": "#1C3622",
+        "STATUS_FG_OK": "#4CD964",
+        "STATUS_BG_WARN": "#3B2E15",
+        "STATUS_FG_WARN": "#FFB340",
+        "STATUS_BG_ERR": "#3B1D20",
+        "STATUS_FG_ERR": "#FF6B6B",
+        "RED_BTN_HOVER": "#4E272B",
+        "TAB_BG": "#1F1F1F",
+        "TAB_SEL_BG": "#2C2C2C",
+        "TAB_SEL_FG": "#FFFFFF",
+        "PROG_BG": "#333333",
+        "BADGE_BG": "#2D2D2D",
+        "BADGE_FG": "#A0A0A0",
+        "ROW_ODD": "#282828",
+        "ROW_EVEN": "#222222",
+        "SCROLL_TROUGH": "#202020",
+        "SCROLL_THUMB": "#3D3D3D",
+    },
+}
+
+
+class InfoToolTip:
+    def __init__(self, widget: tk.Widget, get_text_func, get_theme_func, header: str = "ℹ️  Справка: счётчик в файле и ресурс камеры", lead: str | None = None) -> None:
+        self.widget = widget
+        self.get_text_func = get_text_func
+        self.get_theme_func = get_theme_func
+        self.header = header
+        self.lead = lead  # короткая жирная строка-вывод над подробным текстом (необязательно)
+        self.tip_window: tk.Toplevel | None = None
+        self._show_job: str | None = None
+        self._hide_job: str | None = None
+
+        self.widget.bind("<Enter>", self.schedule_show)
+        self.widget.bind("<Leave>", self.schedule_hide)
+        self.widget.bind("<Button-1>", self.toggle_tip)
+
+    def cancel_jobs(self) -> None:
+        if self._show_job:
+            try:
+                self.widget.after_cancel(self._show_job)
+            except Exception:
+                pass
+            self._show_job = None
+        if self._hide_job:
+            try:
+                self.widget.after_cancel(self._hide_job)
+            except Exception:
+                pass
+            self._hide_job = None
+
+    def schedule_show(self, _event=None) -> None:
+        self.cancel_jobs()
+        if not self.tip_window:
+            self._show_job = self.widget.after(300, self.show_tip)
+
+    def schedule_hide(self, _event=None) -> None:
+        self.cancel_jobs()
+        if self.tip_window:
+            self._hide_job = self.widget.after(160, self.hide_tip)
+
+    def show_tip(self, _event=None) -> None:
+        self.cancel_jobs()
+        if self.tip_window:
+            return
+        text = self.get_text_func()
+        if not text:
+            return
+
+        theme = self.get_theme_func()
+        bg = "#1A1D22" if theme == "dark" else "#FFFFFF"
+        fg = "#E6EDF3" if theme == "dark" else "#1F2328"
+        border = "#38424D" if theme == "dark" else "#D0D7DE"
+        accent = "#60CDFF" if theme == "dark" else "#0067C0"
+
+        screen_h = self.widget.winfo_screenheight()
+        screen_w = self.widget.winfo_screenwidth()
+        wrap_px = 400  # ширина переноса текста — окно подсказки авто-подстраивается под неё
+        tip_w = wrap_px + 28
+        x = self.widget.winfo_rootx() - 320
+        if x + tip_w > screen_w - 20:
+            x = screen_w - tip_w - 20
+        if x < 20:
+            x = 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+
+        box = tk.Frame(tw, bg=bg, highlightbackground=border, highlightthickness=1, padx=14, pady=10)
+        box.pack(fill="both")
+        box.bind("<Enter>", lambda _e: self.cancel_jobs())
+        box.bind("<Leave>", lambda _e: self.schedule_hide())
+
+        header = tk.Label(
+            box, text=self.header,
+            bg=bg, fg=accent, font=("Segoe UI", 10, "bold"), anchor="w",
+            wraplength=wrap_px, justify="left",
+        )
+        header.pack(fill="x", pady=(0, 6))
+
+        if self.lead:
+            lead_lbl = tk.Label(
+                box, text=self.lead, bg=bg, fg=fg, font=("Segoe UI", 11, "bold"),
+                justify="left", anchor="w", wraplength=wrap_px,
+            )
+            lead_lbl.pack(fill="x", pady=(0, 8))
+
+        body = tk.Label(
+            box, text=text, bg=bg, fg=fg, font=("Segoe UI", 9), justify="left", anchor="w",
+            wraplength=wrap_px,
+        )
+        body.pack(fill="x")
+
+        # Если подсказка не поместилась по высоте — подвинуть её, чтобы не улетала
+        # за нижний край экрана (окно самой программы — у верхней части экрана).
+        tw.update_idletasks()
+        tip_h = tw.winfo_reqheight()
+        if y + tip_h > screen_h - 20:
+            y = max(20, screen_h - tip_h - 20)
+        tw.wm_geometry(f"+{x}+{y}")
+
+    def hide_tip(self, _event=None) -> None:
+        self.cancel_jobs()
+        if self.tip_window:
+            try:
+                self.tip_window.destroy()
+            except Exception:
+                pass
+            self.tip_window = None
+
+    def toggle_tip(self, _event=None) -> None:
+        self.cancel_jobs()
+        if self.tip_window:
+            self.hide_tip()
+        else:
+            self.show_tip()
+
+
+class OpenEOSServiceApp:
+    FONT_FAMILY = "Segoe UI"
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+
+        self.theme_name = detect_system_theme()
+        self.update_theme_attrs()
+
+        self.root.configure(bg=self.BG)
+        self.root.title(f"{APP_TITLE} — диагностика фотокамер Canon")
+        self.root.resizable(False, False)
+        self.FONT_FAMILY = "Segoe UI"
+
+        self.setup_window_geometry(860, 520)
+        apply_titlebar_theme(self.root, self.theme_name == "dark")
+        self.setup_app_icon()
+
+        # Состояние приложения
+        self.busy = False
+        self.current_mode: str | None = None
+        self.single_file: str | None = None
+        self.last_single_data: dict | None = None
+        self.batch_results: list[dict] = []
+        self.batch_metadata: dict = {}
+        self.batch_cancel_event = threading.Event()
+        self.batch_process: subprocess.Popen | None = None
+        self.batch_process_lock = threading.Lock()
+        self.batch_folder_path: str | None = None
+        self.batch_total = 0
+        self.batch_processed = 0
+        self.batch_started_at: float | None = None
+        self.render_index = 0
+        self.render_readable = 0
+        self.render_missing = 0
+        self.batch_cancelled = False
+        self.current_tab_index = 0
+
+        self.folder_text = tk.StringVar(value="Папка не выбрана")
+
+        # Менеджер USB PTP сервиса
+        self.ptp_mgr = CanonPTPManager()
+        self.usb_connected = False
+        self.usb_data: dict | None = None
+
+        self.configure_styles()
+        self.create_interface()
+
+        apply_titlebar_theme(self.root, self.theme_name == "dark")
+        self.root.update_idletasks()
+        self.root.deiconify()
+        apply_titlebar_theme(self.root, self.theme_name == "dark")
+
+    def style_tooltip_button(self, widget: tk.Label) -> None:
+        def on_enter(_e):
+            widget.config(fg=self.ACCENT if self.theme_name == "light" else "#60CDFF")
+        def on_leave(_e):
+            widget.config(fg=self.MUTED)
+        widget.bind("<Enter>", on_enter, add="+")
+        widget.bind("<Leave>", on_leave, add="+")
+        self.rating_info_tip = InfoToolTip(widget, self.get_tooltip_text, lambda: self.theme_name)
+
+    def attach_tip(self, widget: tk.Widget, text: str, header: str = "ℹ️  Подсказка", lead: str | None = None) -> InfoToolTip:
+        """Навешивает всплывающую подсказку с фиксированным текстом на любой виджет
+        (кнопку, выпадающий список и т.д.) — наведение или клик показывает текст.
+        lead — необязательная короткая строка-вывод крупным жирным шрифтом над
+        подробным текстом (для длинных подсказок, где сначала нужен быстрый ответ)."""
+        tip = InfoToolTip(widget, lambda: text, lambda: self.theme_name, header=header, lead=lead)
+        self._tip_refs = getattr(self, "_tip_refs", [])
+        self._tip_refs.append(tip)  # держим ссылку, чтобы объект не собрал GC
+        return tip
+
+    @staticmethod
+    def make_text_readonly_but_selectable(text_widget: tk.Text) -> None:
+        """Делает Text-виджет доступным только для чтения, но БЕЗ потери обычного
+        выделения мышью и Ctrl+C. state="disabled" в Tkinter блокирует не только
+        редактирование, но и выделение/копирование — поэтому виджет остаётся в
+        state="normal" (insert()/delete() программой по-прежнему работают), а
+        реальный ввод с клавиатуры блокируется перехватом <Key>: пропускаются
+        только навигация (стрелки, Home/End, PageUp/Down), Ctrl+C (копировать)
+        и Ctrl+A (выделить всё) — остальное гасится (return "break")."""
+        allowed_nav = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next", "Tab"}
+
+        def _on_key(event):
+            ctrl = bool(event.state & 0x0004)
+            if ctrl and event.keysym.lower() in ("c", "a", "insert"):
+                return None  # пропускаем copy / select-all
+            if event.keysym in allowed_nav:
+                return None  # пропускаем навигацию
+            return "break"  # всё остальное (ввод текста, Delete, вставка и т.п.) — блокируем
+
+        text_widget.bind("<Key>", _on_key)
+        # Явный Ctrl+A — выделить весь текст (без него выделение всего текста
+        # было бы недоступно, т.к. виджет не в фокусе редактирования по умолчанию).
+        def _select_all(_event):
+            text_widget.tag_add("sel", "1.0", "end")
+            return "break"
+        text_widget.bind("<Control-a>", _select_all)
+        text_widget.bind("<Control-A>", _select_all)
+
+    def get_tooltip_text(self) -> str:
+        model = self.single_meta.get("model")
+        model_name = model.cget("text") if model else ""
+        has_model = bool(model_name and model_name not in ("—", "Не определена"))
+        rating = get_camera_rating(model_name) if has_model else None
+
+        if rating:
+            rating_str = f"~{rating:,} кадров".replace(",", " ")
+            res_bullet = f"• Расчётный ресурс механики для {model_name}: {rating_str}."
+        else:
+            res_bullet = "• Паспортный ресурс производителя нормирует только механический узел шторок."
+
+        return (
+            "Счётчик в метаданных кадра (RAW / JPEG):\n"
+            "• Фиксирует общее количество спусков во всех режимах съёмки, включая электронный затвор.\n\n"
+            "Паспортный ресурс камеры:\n"
+            f"{res_bullet}\n"
+            "• Заявленный ресурс производителя относится исключительно к механическим шторкам.\n\n"
+            "Практический вывод:\n"
+            "• Съёмка с электронным затвором не расходует ресурс механического узла камеры."
+        )
+
+    def setup_app_icon(self) -> None:
+        try:
+            myappid = f"openeos.service.desktop.{APP_VERSION}"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        local_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+
+        for folder in (base_dir, local_dir):
+            if not folder or not os.path.isdir(folder):
+                continue
+
+            service_ico = os.path.join(folder, "app_icon_service.ico")
+            if not os.path.isfile(service_ico):
+                try:
+                    import create_icons
+                    create_icons.generate_all_icons(folder)
+                except Exception:
+                    pass
+
+            for candidate in ("app_icon_service.ico", "app_icon.ico"):
+                ico_path = os.path.join(folder, candidate)
+                if os.path.isfile(ico_path):
+                    try:
+                        self.root.iconbitmap(ico_path)
+                        break
+                    except Exception:
+                        pass
+
+            for png_name in ("app_icon_service.png", "app_icon.png"):
+                png_path = os.path.join(folder, png_name)
+                if os.path.isfile(png_path):
+                    try:
+                        self.app_photo_icon = tk.PhotoImage(file=png_path)
+                        self.root.iconphoto(True, self.app_photo_icon)
+                        break
+                    except Exception:
+                        pass
+            return
+
+    def update_theme_attrs(self) -> None:
+        palette = THEMES[self.theme_name]
+        for k, v in palette.items():
+            setattr(self, k, v)
+
+    def setup_window_geometry(self, width: int, height: int) -> None:
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        w = min(width, screen_w - 40)
+        h = min(height, screen_h - 80)
+        x = max(0, (screen_w - w) // 2)
+        y = max(0, (screen_h - h) // 2)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.resizable(False, False)
+
+    def toggle_theme(self) -> None:
+        if self.busy and self.current_mode == "batch":
+            messagebox.showinfo("OpenEOS", "Смена темы недоступна во время пакетного анализа.")
+            return
+
+        self.theme_name = "dark" if self.theme_name == "light" else "light"
+        self.update_theme_attrs()
+        self.configure_styles()
+
+        last_shutter_text = self.counter_label.cget("text")
+        last_status_text = self.single_status_label.cget("text")
+        last_file_label = self.selected_file_label.cget("text")
+        last_meta = {k: v.cget("text") for k, v in self.single_meta.items()}
+        active_tab = self.current_tab_index
+        # Вкладка «Карта»: смена темы пересоздаёт все виджеты заново — без этого
+        # результат чтения и вписанная метка камеры бесследно исчезали.
+        last_card_label = self.card_label_var.get() if hasattr(self, "card_label_var") else ""
+
+        if hasattr(self, "rating_info_tip") and self.rating_info_tip:
+            self.rating_info_tip.hide_tip()
+
+        for child in self.root.winfo_children():
+            child.destroy()
+
+        self.create_interface()
+        self.switch_tab(active_tab, initial=True)
+
+        # Восстанавливаем вкладку «USB» (переподключаться не нужно — просто
+        # заново отрисовываем уже полученные данные) и вкладку «Карта».
+        if getattr(self, "usb_connected", False) and getattr(self, "usb_data", None):
+            self._on_connect_success(self.usb_data)
+        if last_card_label:
+            self.card_label_var.set(last_card_label)
+        if getattr(self, "card_last_data", None):
+            lines = self._build_card_result_lines(self.card_last_data)
+            self.card_result_text.delete("1.0", "end")
+            self.card_result_text.insert("1.0", "\n".join(lines))
+            self.card_save_btn.config(state="normal")
+            self.card_status_lbl.config(text="✓ Файл прочитан.", fg=self.TEXT)
+
+        apply_titlebar_theme(self.root, self.theme_name == "dark")
+        self.counter_label.config(text=last_shutter_text)
+        if "Готово" in last_status_text or "Проверено" in last_status_text:
+            self.set_single_status("●  Готово", self.STATUS_BG_OK, self.STATUS_FG_OK)
+        elif "Ожидает" in last_status_text:
+            self.set_single_status("●  Ожидает фото", self.STATUS_BG_IDLE, self.STATUS_FG_IDLE)
+        elif "Не найден" in last_status_text:
+            self.set_single_status("●  Счётчик не найден", self.STATUS_BG_WARN, self.STATUS_FG_WARN)
+        elif "Ошибка" in last_status_text:
+            self.set_single_status("✕  Ошибка", self.STATUS_BG_ERR, self.STATUS_FG_ERR)
+        else:
+            self.set_single_status(last_status_text, self.STATUS_BG_IDLE, self.STATUS_FG_IDLE)
+
+        self.selected_file_label.config(text=last_file_label)
+        for k, val in last_meta.items():
+            if k in self.single_meta:
+                self.single_meta[k].config(text=val)
+
+        if self.batch_results:
+            self.start_table_render()
+
+    def style_button(self, btn: tk.Button, bg: str, hover_bg: str, fg: str, font: tuple | None = None) -> tk.Button:
+        if font is None:
+            font = (self.FONT_FAMILY, 9, "bold")
+        btn.config(
+            bg=bg, fg=fg,
+            activebackground=hover_bg,
+            activeforeground=fg,
+            disabledforeground=self.SUBTLE,
+            relief="flat", bd=0,
+            font=font,
+            cursor="hand2"
+        )
+        def on_enter(_event):
+            if str(btn["state"]) != "disabled":
+                btn.config(bg=hover_bg)
+        def on_leave(_event):
+            if str(btn["state"]) != "disabled":
+                btn.config(bg=bg)
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        return btn
+
+    def configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Treeview",
+            background=self.CARD,
+            fieldbackground=self.CARD,
+            foreground=self.TEXT,
+            rowheight=28,
+            borderwidth=0,
+            relief="flat",
+            font=(self.FONT_FAMILY, 9),
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=self.GRAY_BTN,
+            foreground=self.MUTED,
+            font=(self.FONT_FAMILY, 8, "bold"),
+            relief="flat",
+            borderwidth=0,
+            padding=(8, 6),
+        )
+        style.map(
+            "Treeview.Heading",
+            background=[("active", self.BORDER)],
+            foreground=[("active", self.TEXT)],
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", self.ACCENT_BG)],
+            foreground=[("selected", self.TEXT)],
+        )
+
+        for sbar_name in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(
+                sbar_name,
+                gripcount=0,
+                background=self.SCROLL_THUMB,
+                darkcolor=self.CARD,
+                lightcolor=self.CARD,
+                troughcolor=self.SCROLL_TROUGH,
+                bordercolor=self.CARD,
+                arrowcolor=self.MUTED,
+                arrowsize=12,
+            )
+            style.map(
+                sbar_name,
+                background=[("active", self.MUTED), ("pressed", self.ACCENT)],
+                arrowcolor=[("active", self.TEXT)],
+            )
+
+    @staticmethod
+    def compact_text(value: str | None, limit: int = 70) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        keep = max(8, (limit - 1) // 2)
+        return text[:keep] + "…" + text[-keep:]
+
+    def create_interface(self) -> None:
+        self.root.configure(bg=self.BG)
+
+        # Верхняя панель: Название, подзаголовок, кнопка темы и версия
+        header = tk.Frame(self.root, bg=self.BG)
+        header.pack(fill="x", padx=24, pady=(12, 8))
+
+        left_col = tk.Frame(header, bg=self.BG)
+        left_col.pack(side="left", fill="y")
+
+        # Фирменная зелёная иконка сервисной утилиты OpenEOS Service
+        self.header_icon_label = None
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        service_png = os.path.join(base_dir, "app_icon_service.png")
+        if os.path.isfile(service_png):
+            try:
+                self.header_icon_img = tk.PhotoImage(file=service_png).subsample(9, 9)
+                self.header_icon_label = tk.Label(left_col, image=self.header_icon_img, bg=self.BG)
+                self.header_icon_label.pack(side="left", padx=(0, 10), anchor="center")
+            except Exception:
+                pass
+
+        title_label = tk.Label(
+            left_col, text=APP_TITLE, bg=self.BG, fg=self.TEXT,
+            font=(self.FONT_FAMILY, 20, "bold")
+        )
+        title_label.pack(side="left", anchor="center")
+
+        service_badge = tk.Label(
+            left_col, text="SERVICE", bg="#16845B", fg="#FFFFFF",
+            font=(self.FONT_FAMILY, 7, "bold"), padx=6, pady=2
+        )
+        service_badge.pack(side="left", padx=(8, 0), anchor="center")
+
+        subtitle = tk.Label(
+            left_col,
+            text="Диагностика затвора и журнала ошибок Canon",
+            bg=self.BG, fg=self.MUTED, font=(self.FONT_FAMILY, 9)
+        )
+        subtitle.pack(side="left", padx=(10, 0), anchor="center")
+
+        right_col = tk.Frame(header, bg=self.BG)
+        right_col.pack(side="right", fill="y")
+
+        theme_text = "🌙  Тёмная" if self.theme_name == "light" else "☀️  Светлая"
+        self.theme_btn = tk.Button(
+            right_col, text=theme_text, command=self.toggle_theme,
+            font=(self.FONT_FAMILY, 8, "bold"), padx=10, pady=3
+        )
+        self.style_button(
+            self.theme_btn,
+            bg=self.BADGE_BG, hover_bg=self.GRAY_BTN_HOVER, fg=self.BADGE_FG
+        )
+        self.theme_btn.pack(side="left", padx=(0, 8))
+
+        v_pill = tk.Label(
+            right_col, text=f"v{APP_VERSION}", bg=self.BADGE_BG, fg=self.BADGE_FG,
+            font=(self.FONT_FAMILY, 8, "bold"), padx=8, pady=3
+        )
+        v_pill.pack(side="left")
+
+        # Сегментированные вкладки (3 вкладки!)
+        self.tab_bar_frame = tk.Frame(self.root, bg=self.BG)
+        self.tab_bar_frame.pack(fill="x", padx=24, pady=(0, 0))
+
+        tabs_inner = tk.Frame(self.tab_bar_frame, bg=self.BG)
+        tabs_inner.pack(side="left")
+
+        self.tab_btn_1 = tk.Button(
+            tabs_inner, text="Проверить фото", command=lambda: self.switch_tab(0),
+            padx=18, pady=7, font=(self.FONT_FAMILY, 9, "bold"),
+            bd=0, relief="flat", cursor="hand2"
+        )
+        self.tab_btn_1.pack(side="left", padx=(0, 6))
+
+        self.tab_btn_2 = tk.Button(
+            tabs_inner, text="Анализ папки", command=lambda: self.switch_tab(1),
+            padx=18, pady=7, font=(self.FONT_FAMILY, 9, "bold"),
+            bd=0, relief="flat", cursor="hand2"
+        )
+        self.tab_btn_2.pack(side="left", padx=(0, 6))
+
+        self.tab_btn_3 = tk.Button(
+            tabs_inner, text="🔌  Камера по USB", command=lambda: self.switch_tab(2),
+            padx=18, pady=7, font=(self.FONT_FAMILY, 9, "bold"),
+            bd=0, relief="flat", cursor="hand2"
+        )
+        self.tab_btn_3.pack(side="left", padx=(0, 6))
+
+        self.tab_btn_4 = tk.Button(
+            tabs_inner, text="💳  Карта памяти", command=lambda: self.switch_tab(3),
+            padx=18, pady=7, font=(self.FONT_FAMILY, 9, "bold"),
+            bd=0, relief="flat", cursor="hand2"
+        )
+        self.tab_btn_4.pack(side="left")
+
+        self.tab_baseline = tk.Frame(self.root, bg=self.BORDER, height=1)
+        self.tab_baseline.pack(fill="x", padx=24, pady=(3, 6))
+
+        self.tab_content = tk.Frame(self.root, bg=self.BG)
+        self.tab_content.pack(fill="both", expand=True)
+
+        self.single_tab = tk.Frame(self.tab_content, bg=self.BG)
+        self.batch_tab = tk.Frame(self.tab_content, bg=self.BG)
+        self.usb_tab = tk.Frame(self.tab_content, bg=self.BG)
+        self.card_tab = tk.Frame(self.tab_content, bg=self.BG)
+
+        self.create_single_tab()
+        self.create_batch_tab()
+        self.create_usb_tab()
+        self.create_card_tab()
+
+        self.switch_tab(2, initial=True)  # По умолчанию открываем вкладку USB!
+
+        if DND_AVAILABLE:
+            self.register_drop_targets(self.single_tab)
+            self.register_drop_targets(self.batch_tab)
+
+    def switch_tab(self, index: int, initial: bool = False) -> None:
+        if self.busy and self.current_mode == "batch" and index != 1:
+            messagebox.showinfo("OpenEOS", "Сначала дождитесь завершения операции или остановите анализ.")
+            return
+
+        self.current_tab_index = index
+
+        # Скрываем все вкладки
+        self.single_tab.pack_forget()
+        self.batch_tab.pack_forget()
+        self.usb_tab.pack_forget()
+        self.card_tab.pack_forget()
+
+        # Сбрасываем стили кнопок
+        for btn in (self.tab_btn_1, self.tab_btn_2, self.tab_btn_3, self.tab_btn_4):
+            btn.config(
+                bg=self.BG, fg=self.MUTED,
+                activebackground=self.BG, activeforeground=self.TEXT,
+                highlightthickness=0
+            )
+
+        if index == 0:
+            self.single_tab.pack(fill="both", expand=True)
+            self.tab_btn_1.config(
+                bg=self.TAB_SEL_BG, fg=self.TAB_SEL_FG,
+                activebackground=self.TAB_SEL_BG, activeforeground=self.TAB_SEL_FG,
+                highlightthickness=1, highlightbackground=self.BORDER
+            )
+        elif index == 1:
+            self.batch_tab.pack(fill="both", expand=True)
+            self.tab_btn_2.config(
+                bg=self.TAB_SEL_BG, fg=self.TAB_SEL_FG,
+                activebackground=self.TAB_SEL_BG, activeforeground=self.TAB_SEL_FG,
+                highlightthickness=1, highlightbackground=self.BORDER
+            )
+        elif index == 2:
+            self.usb_tab.pack(fill="both", expand=True)
+            service_accent = "#16845B" if self.theme_name == "light" else "#34D399"
+            self.tab_btn_3.config(
+                bg=self.TAB_SEL_BG, fg=service_accent,
+                activebackground=self.TAB_SEL_BG, activeforeground=service_accent,
+                highlightthickness=1, highlightbackground=service_accent
+            )
+        else:
+            self.card_tab.pack(fill="both", expand=True)
+            service_accent = "#16845B" if self.theme_name == "light" else "#34D399"
+            self.tab_btn_4.config(
+                bg=self.TAB_SEL_BG, fg=service_accent,
+                activebackground=self.TAB_SEL_BG, activeforeground=service_accent,
+                highlightthickness=1, highlightbackground=service_accent
+            )
+
+    # ---------------------------------------------------------------------------
+    # Вкладка 3: Сервис USB (Прямое подключение)
+    # ---------------------------------------------------------------------------
+    def create_usb_tab(self) -> None:
+        page = tk.Frame(self.usb_tab, bg=self.BG)
+        page.pack(fill="both", expand=True, padx=24, pady=(2, 10))
+
+        # 1. Верхняя панель управления подключением (Connection Bar)
+        ctrl_card = tk.Frame(page, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, bd=0)
+        ctrl_card.pack(fill="x", pady=(0, 8))
+
+        ctrl_inner = tk.Frame(ctrl_card, bg=self.CARD)
+        ctrl_inner.pack(fill="x", padx=14, pady=10)
+
+        # Кнопка Подключить / Отключить
+        self.usb_connect_btn = tk.Button(
+            ctrl_inner, text="Подключить", command=self.toggle_usb_connect,
+            padx=20, pady=7, font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.style_button(
+            self.usb_connect_btn,
+            bg="#16845B", hover_bg="#13734F", fg="#FFFFFF"
+        )
+        self.usb_connect_btn.pack(side="left", padx=(0, 10))
+
+        # Кнопка Прочитать счётчики (PTP)
+        self.usb_read_counters_btn = tk.Button(
+            ctrl_inner, text="Прочитать счётчики", command=self.read_usb_counters,
+            padx=18, pady=7, font=(self.FONT_FAMILY, 9, "bold"), state="disabled"
+        )
+        self.style_button(
+            self.usb_read_counters_btn,
+            bg=self.ACCENT, hover_bg=self.ACCENT_HOVER, fg="#FFFFFF"
+        )
+        self.usb_read_counters_btn.pack(side="left", padx=(0, 14))
+
+        # Статус соединения
+        self.usb_status_label = tk.Label(
+            ctrl_inner, text="●  Камера не подключена (включите камеру и подсоедините USB-кабель)",
+            bg=self.STATUS_BG_IDLE, fg=self.STATUS_FG_IDLE,
+            font=(self.FONT_FAMILY, 9, "bold"), padx=12, pady=6
+        )
+        self.usb_status_label.pack(side="left", fill="x", expand=True)
+
+
+        # 2. Карточка затвора и диагностики
+        self.usb_result_card = tk.Frame(page, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, bd=0)
+        self.usb_result_card.pack(fill="x", pady=(0, 8))
+
+        # Заголовок карточки
+        tk.Label(
+            self.usb_result_card, text="ПОКАЗАНИЯ ДИАГНОСТИЧЕСКИХ СЧЁТЧИКОВ",
+            bg=self.CARD, fg=self.MUTED, font=(self.FONT_FAMILY, 9, "bold")
+        ).pack(pady=(10, 2))
+
+        # Ряд: крупный механический счётчик + человечный бейдж ресурса
+        val_row = tk.Frame(self.usb_result_card, bg=self.CARD)
+        val_row.pack(anchor="center", pady=(1, 4))
+
+        self.usb_shutter_label = tk.Label(
+            val_row, text="—", bg=self.CARD, fg=self.TEXT,
+            font=(self.FONT_FAMILY, 40, "bold")
+        )
+        self.usb_shutter_label.pack(side="left", padx=(0, 14))
+
+        self.usb_wear_badge = tk.Label(
+            val_row, text="●  Ожидает подключения", bg=self.STATUS_BG_IDLE, fg=self.STATUS_FG_IDLE,
+            font=(self.FONT_FAMILY, 9, "bold"), padx=12, pady=5
+        )
+        self.usb_wear_badge.pack(side="left", pady=(8, 0))
+
+        # Разделитель
+        tk.Frame(self.usb_result_card, bg=self.BORDER, height=1).pack(fill="x", padx=24, pady=(4, 8))
+
+        # 4 колонки: Общий спуск, Электронный затвор, Температура, Аккумулятор
+        meta_frame = tk.Frame(self.usb_result_card, bg=self.CARD)
+        meta_frame.pack(fill="x", padx=20, pady=(0, 10))
+        meta_frame.columnconfigure(0, weight=1)
+        meta_frame.columnconfigure(1, weight=1)
+        meta_frame.columnconfigure(2, weight=1)
+        meta_frame.columnconfigure(3, weight=1)
+
+        self.usb_cols = {}
+        for col, (label, key) in enumerate((
+            ("ОБЩИЙ СПУСК", "release_total"),
+            ("ЭЛЕКТРОННЫЙ ЗАТВОР", "electronic"),
+            ("ТЕМПЕРАТУРА", "temp"),
+            ("АККУМУЛЯТОР", "battery"),
+        )):
+            cell = tk.Frame(meta_frame, bg=self.CARD)
+            cell.grid(row=0, column=col, sticky="nsew", padx=6)
+
+            tk.Label(
+                cell, text=label, bg=self.CARD, fg=self.MUTED,
+                font=(self.FONT_FAMILY, 8, "bold")
+            ).pack(anchor="center")
+
+            val_lbl = tk.Label(
+                cell, text="—", bg=self.CARD, fg=self.TEXT,
+                font=(self.FONT_FAMILY, 10, "bold")
+            )
+            val_lbl.pack(fill="x", pady=(3, 0))
+            self.usb_cols[key] = val_lbl
+
+        # 3. Карточка аппаратных ошибок (Error Log)
+        self.usb_err_card = tk.Frame(page, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, bd=0)
+        self.usb_err_card.pack(fill="x")
+
+        err_inner = tk.Frame(self.usb_err_card, bg=self.CARD)
+        err_inner.pack(fill="x", padx=16, pady=8)
+
+        # Кнопка «Сохранить отчёт» — справа внизу карточки ошибок (в панели подключения не помещалась)
+        self.usb_save_btn = tk.Button(
+            err_inner, text="Сохранить отчёт…", command=self.save_usb_report,
+            padx=16, pady=7, font=(self.FONT_FAMILY, 9, "bold"), state="disabled"
+        )
+        self.style_button(
+            self.usb_save_btn,
+            bg=self.GRAY_BTN, hover_bg=self.GRAY_BTN_HOVER, fg=self.GRAY_BTN_FG
+        )
+        self.usb_save_btn.pack(side="right", anchor="s", padx=(12, 0))
+
+        tk.Label(
+            err_inner, text="ЖУРНАЛ АППАРАТНЫХ ОШИБОК (ERROR LOG)",
+            bg=self.CARD, fg=self.MUTED, font=(self.FONT_FAMILY, 8, "bold")
+        ).pack(anchor="w", pady=(0, 3))
+
+        # Горизонтальная статусная строка ошибок
+        self.usb_err_status = tk.Label(
+            err_inner, text="●  Камера не опрошена",
+            bg=self.CARD, fg=self.MUTED, font=(self.FONT_FAMILY, 9), anchor="w"
+        )
+        self.usb_err_status.pack(fill="x", pady=(1, 2))
+
+        self.usb_err_note = tk.Label(
+            err_inner, text="Механика может отставать на 1 кадр. Выкл/вкл камеры с закрытой шторкой добавляет 1 срабатывание.",
+            bg=self.CARD, fg=self.SUBTLE, font=(self.FONT_FAMILY, 8), anchor="w"
+        )
+        self.usb_err_note.pack(fill="x")
+
+    def toggle_usb_connect(self) -> None:
+        if self.usb_connected:
+            self.disconnect_usb()
+        else:
+            self.connect_usb()
+
+    def connect_usb(self) -> None:
+        self.usb_status_label.config(
+            text="⏳  Поиск и опрос камеры по USB… (включите камеру)",
+            bg=self.ACCENT_BG, fg=self.ACCENT
+        )
+        self.usb_connect_btn.config(state="disabled")
+        self.root.update_idletasks()
+
+        def _connect_worker():
+            try:
+                data = self.ptp_mgr.connect()
+                self.root.after(0, self._on_connect_success, data)
+            except Exception as exc:
+                err_msg = str(exc).strip()
+                self.root.after(0, self._on_connect_error, err_msg)
+
+        threading.Thread(target=_connect_worker, daemon=True).start()
+
+    def _on_connect_success(self, data: dict) -> None:
+        self.usb_connected = True
+        self.usb_data = data
+
+        # Активируем кнопку чтения PTP-счётчиков
+        self.usb_read_counters_btn.config(state="normal")
+
+        # Обновление кнопки подключения -> Отключить
+        self.usb_connect_btn.config(text="Отключить", state="normal")
+        self.style_button(
+            self.usb_connect_btn,
+            bg=self.GRAY_BTN, hover_bg=self.RED_BTN_HOVER, fg=self.GRAY_BTN_FG
+        )
+
+        # Статус подключения с серийником и прошивкой
+        self.usb_status_label.config(
+            text=f"●  Подключено: {data['model']} (№ {data['serial']} · FW v{data['firmware']})",
+            bg=self.STATUS_BG_OK, fg=self.STATUS_FG_OK
+        )
+
+        # Крупный механический счетчик и бейдж ресурса
+        shutter_val = data.get("shutter_mechanical")
+        rating_formatted = f"{data['rating']:,}".replace(",", " ")
+        if shutter_val is not None:
+            shutter_formatted = f"{shutter_val:,}".replace(",", " ")
+            wear_val = data.get("wear_percent")
+            wear_str = f"{wear_val}%" if wear_val is not None else "—"
+            badge_text = f"Использовано ресурса: {wear_str} (из {rating_formatted})"
+            badge_bg = self.STATUS_BG_OK
+            badge_fg = self.STATUS_FG_OK
+        else:
+            shutter_formatted = "—"
+            badge_text = f"Паспортный ресурс: {rating_formatted}"
+            badge_bg = self.STATUS_BG_IDLE
+            badge_fg = self.STATUS_FG_IDLE
+
+        self.usb_shutter_label.config(text=shutter_formatted)
+        self.usb_wear_badge.config(text=badge_text, bg=badge_bg, fg=badge_fg)
+
+        # 4 колонки
+        rel_val = data.get("release_total")
+        rel_formatted = f"{rel_val:,}".replace(",", " ") if rel_val is not None else "—"
+        self.usb_cols["release_total"].config(text=rel_formatted)
+
+        elec_val = data.get("electronic_shots")
+        if elec_val is not None:
+            elec_formatted = f"{elec_val:,} ({data.get('electronic_pct', 0)}%)".replace(",", " ")
+        else:
+            elec_formatted = "—"
+        self.usb_cols["electronic"].config(text=elec_formatted)
+
+        # Температура сенсора и платы
+        t_img = data.get("temp_imager")
+        t_pcb = data.get("temp_pcb")
+        if t_img is not None and t_pcb is not None:
+            temp_str = f"Сенсор: {t_img} °C  ·  Плата: {t_pcb} °C"
+        elif t_img is not None:
+            temp_str = f"Сенсор: {t_img} °C"
+        elif t_pcb is not None:
+            temp_str = f"Плата: {t_pcb} °C"
+        else:
+            temp_str = "—"
+        self.usb_cols["temp"].config(text=temp_str)
+
+        # Аккумулятор с цветной индикацией
+        bat_pct = data.get("battery_percent")
+        if bat_pct is not None and bat_pct >= 0:
+            if bat_pct >= 50:
+                bat_icon = "🟢"
+                bat_fg = "#16845B" if self.theme_name == "light" else "#34D399"
+            elif bat_pct >= 20:
+                bat_icon = "🟡"
+                bat_fg = "#D97706" if self.theme_name == "light" else "#FBBF24"
+            else:
+                bat_icon = "🔴"
+                bat_fg = "#DC2626" if self.theme_name == "light" else "#F87171"
+            self.usb_cols["battery"].config(text=f"{bat_icon}  {bat_pct}%", fg=bat_fg)
+        else:
+            self.usb_cols["battery"].config(text="—", fg=self.TEXT)
+
+        # Горизонтальная строка ошибок
+        if not data.get("errors"):
+            self.usb_err_status.config(
+                text="●  Журнал ошибок пока не считывается (функция не реализована)",
+                fg=self.MUTED
+            )
+        else:
+            err_summary = ", ".join(f"{e['code']} ({e['name']})" for e in data["errors"])
+            self.usb_err_status.config(
+                text=f"●  Зафиксированы инциденты: {err_summary}",
+                fg=self.STATUS_FG_WARN
+            )
+
+        # Наработка и число включений
+        pwr_val = data.get("power_on_count")
+        run_tm = data.get("running_time")
+        note_parts = []
+        if pwr_val is not None:
+            note_parts.append(f"Включений: {pwr_val:,}".replace(",", " "))
+        if run_tm:
+            note_parts.append(f"Наработка: {run_tm}")
+        self.usb_err_note.config(
+            text="  ·  ".join(note_parts) if note_parts else "Механика может отставать на 1 кадр. Выкл/вкл камеры с закрытой шторкой добавляет 1 срабатывание.",
+            fg=self.MUTED
+        )
+
+        # Активируем кнопку сохранения отчёта
+        self.usb_save_btn.config(state="normal")
+
+    def _on_connect_error(self, err_msg: str) -> None:
+        self.disconnect_usb(keep_status=True)
+        self.usb_status_label.config(
+            text=f"✕  {err_msg}",
+            bg=self.STATUS_BG_ERR, fg=self.STATUS_FG_ERR
+        )
+
+    def disconnect_usb(self, keep_status: bool = False) -> None:
+        self.ptp_mgr.disconnect()
+        self.usb_connected = False
+        self.usb_data = None
+
+        self.usb_connect_btn.config(text="Подключить", state="normal")
+        self.style_button(
+            self.usb_connect_btn,
+            bg="#16845B", hover_bg="#13734F", fg="#FFFFFF"
+        )
+
+        if not keep_status:
+            self.usb_status_label.config(
+                text="●  Камера безопасно отключена (кабель можно извлечь)",
+                bg=self.STATUS_BG_IDLE, fg=self.STATUS_FG_IDLE
+            )
+
+        self.usb_shutter_label.config(text="—")
+        self.usb_wear_badge.config(
+            text="●  Ожидает подключения",
+            bg=self.STATUS_BG_IDLE, fg=self.STATUS_FG_IDLE
+        )
+        self.usb_cols["release_total"].config(text="—")
+        self.usb_cols["electronic"].config(text="—")
+        self.usb_cols["temp"].config(text="—")
+        self.usb_cols["battery"].config(text="—", fg=self.TEXT)
+
+        self.usb_err_status.config(
+            text="●  Камера не опрошена",
+            fg=self.MUTED
+        )
+        self.usb_err_note.config(text="Механика может отставать на 1 кадр. Выкл/вкл камеры с закрытой шторкой добавляет 1 срабатывание.", fg=self.SUBTLE)
+        self.usb_save_btn.config(state="disabled")
+
+        # Сброс кнопки чтения PTP
+        self.usb_read_counters_btn.config(state="disabled", text="Прочитать счётчики")
+
+    def read_usb_counters(self) -> None:
+        if not self.usb_connected:
+            messagebox.showinfo(APP_TITLE, "Сначала подключите камеру кнопкой «Подключить».")
+            return
+
+        self.usb_read_counters_btn.config(state="disabled", text="⏳ Чтение…")
+        self.usb_status_label.config(
+            text="⏳  Чтение счётчиков с камеры… (до 1 минуты, не отключайте кабель)",
+            bg=self.ACCENT_BG, fg=self.ACCENT
+        )
+        self.root.update_idletasks()
+
+        def _worker():
+            try:
+                res_dict = self.ptp_mgr.read_live_ptp_properties()
+                self.root.after(0, self._on_counters_read_complete, res_dict)
+            except Exception as exc:
+                err_str = str(exc).strip()
+                self.root.after(0, self._on_counters_read_error, err_str)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_counters_read_complete(self, res_dict: dict) -> None:
+        self.usb_read_counters_btn.config(state="normal", text="Прочитать счётчики")
+
+        c1 = res_dict.get("counter_0x12000001")
+        if c1 is not None:
+            self.usb_shutter_label.config(text=f"{c1:,}".replace(",", " "))
+            rating = (self.usb_data.get("rating", 0) if self.usb_data else 0) or 100000
+            wear_val = round((c1 / rating) * 100, 1)
+            rating_formatted = f"{rating:,}".replace(",", " ")
+            self.usb_wear_badge.config(
+                text=f"Использовано ресурса: {wear_val}% (из {rating_formatted})",
+                bg=self.STATUS_BG_OK, fg=self.STATUS_FG_OK
+            )
+
+        c3 = res_dict.get("counter_0x12000003")
+        if c3 is not None:
+            self.usb_cols["release_total"].config(text=f"{c3:,}".replace(",", " "))
+
+        if c1 is not None and c3 is not None and c3 >= c1:
+            elec_shots = c3 - c1
+            elec_pct = round((elec_shots / c3) * 100, 1) if c3 > 0 else 0
+            self.usb_cols["electronic"].config(text=f"{elec_shots:,} ({elec_pct}%)".replace(",", " "))
+
+        pwr_val = res_dict.get("power_on_count")
+        uptime_val = res_dict.get("uptime_seconds")
+        if pwr_val is not None or uptime_val is not None:
+            note_parts = []
+            if pwr_val is not None:
+                note_parts.append(f"Включений: {pwr_val:,}".replace(",", " "))
+            if uptime_val is not None:
+                d = uptime_val // 86400
+                h = (uptime_val % 86400) // 3600
+                m = (uptime_val % 3600) // 60
+                s = uptime_val % 60
+                note_parts.append(f"Наработка: {d}д {h:02d}ч {m:02d}м {s:02d}с")
+            self.usb_err_note.config(text="  ·  ".join(note_parts + ["механика: возможно отставание на 1 кадр"]), fg=self.MUTED)
+
+        # Журнал ошибок камеры (0x13000000)
+        errs = res_dict.get("errors")
+        if errs is not None:
+            if not errs:
+                self.usb_err_status.config(text="●  Ошибок нет", fg=self.STATUS_FG_OK)
+            else:
+                parts = [f"{e.get('short', e['code'])} ({e['date'][:10]})" for e in errs]
+                self.usb_err_status.config(
+                    text=f"●  Ошибки ({len(errs)}):  " + "  ·  ".join(parts),
+                    fg=self.STATUS_FG_WARN
+                )
+
+        # Статусное сообщение в основной строке статуса
+        st_overall = res_dict.get("status", "UNKNOWN")
+        err_msg = res_dict.get("error_message")
+        cur_time = time.strftime("%H:%M:%S")
+
+        if st_overall == "SUCCESS":
+            if c1 is not None or c3 is not None:
+                c1_txt = f"{c1:,}".replace(",", " ") if c1 is not None else "—"
+                c3_txt = f"{c3:,}".replace(",", " ") if c3 is not None else "—"
+                self.usb_status_label.config(
+                    text=f"●  [{cur_time}] Счётчики прочитаны (Механический: {c1_txt} · Общий: {c3_txt})",
+                    bg=self.STATUS_BG_OK, fg=self.STATUS_FG_OK
+                )
+            else:
+                self.usb_status_label.config(
+                    text=f"●  [{cur_time}] WPD MTP PTP-обмен: УСПЕХ (0x2001 OK)",
+                    bg=self.STATUS_BG_OK, fg=self.STATUS_FG_OK
+                )
+        elif st_overall == "PARTIAL_SUCCESS":
+            self.usb_status_label.config(
+                text=f"●  [{cur_time}] Частичный отклик: {err_msg or ''}",
+                bg=self.STATUS_BG_WARN, fg=self.STATUS_FG_WARN
+            )
+        elif st_overall == "UNSUPPORTED":
+            self.usb_status_label.config(
+                text=f"●  [{cur_time}] {err_msg or 'Чтение счётчиков для этой модели пока не поддерживается.'}",
+                bg=self.STATUS_BG_WARN, fg=self.STATUS_FG_WARN
+            )
+        else:
+            self.usb_status_label.config(
+                text=f"✕  [{cur_time}] {err_msg or 'Сбой при чтении PTP-свойств камеры.'}",
+                bg=self.STATUS_BG_ERR, fg=self.STATUS_FG_ERR
+            )
+
+    def _on_counters_read_error(self, err_str: str) -> None:
+        self.usb_read_counters_btn.config(state="normal", text="Прочитать счётчики")
+        cur_time = time.strftime("%H:%M:%S")
+        self.usb_status_label.config(
+            text=f"✕  [{cur_time}] Ошибка опроса камеры: {err_str}",
+            bg=self.STATUS_BG_ERR, fg=self.STATUS_FG_ERR
+        )
+
+    def save_usb_report(self) -> None:
+        if not self.usb_connected or not self.usb_data:
+            messagebox.showinfo(APP_TITLE, "Сначала подключите камеру для формирования отчёта.")
+            return
+
+        report_text = self.ptp_mgr.export_report_text()
+        default_name = f"Diagnostic_{self.usb_data['model'].replace(' ', '_')}_{self.usb_data['serial']}.txt"
+
+        path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт диагностики",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Текстовый отчёт", "*.txt"), ("Все файлы", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report_text)
+            messagebox.showinfo(APP_TITLE, f"Отчёт успешно сохранён:\n{path}")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Не удалось сохранить файл:\n{str(exc)}")
+
+    # ---------------------------------------------------------------------------
+    # Вкладка 4: альтернативный метод — встроенная заводская диагностика камеры
+    # (CamInfo_Debug) через SD-карту. Не использует USB PTP служебный канал.
+    # Ничего не пишет в камеру и не форматирует карту — это делает сторонняя
+    # утилита EOScard.
+    # ---------------------------------------------------------------------------
+    def create_card_tab(self) -> None:
+        page = tk.Frame(self.card_tab, bg=self.BG)
+        page.pack(fill="both", expand=True, padx=24, pady=(2, 10))
+
+        # 1. Карточка с описанием метода — намеренно СЖАТА до 2 строк текста:
+        # окно 860×520 нерезиновое, а под результат нужно как можно больше места.
+        # Все подробности (шаги, совместимость) — только во всплывающих подсказках.
+        info_card = tk.Frame(page, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, bd=0)
+        info_card.pack(fill="x", pady=(0, 6))
+        info_inner = tk.Frame(info_card, bg=self.CARD)
+        info_inner.pack(fill="x", padx=16, pady=8)
+
+        header_row = tk.Frame(info_inner, bg=self.CARD)
+        header_row.pack(fill="x", pady=(0, 2))
+
+        card_tab_header = tk.Label(
+            header_row, text="ЧТЕНИЕ ЧЕРЕЗ КАРТУ ПАМЯТИ (CamInfo_Debug)",
+            bg=self.CARD, fg=self.MUTED, font=(self.FONT_FAMILY, 8, "bold")
+        )
+        card_tab_header.pack(side="left")
+        self.attach_tip(
+            card_tab_header,
+            "Это по собственным тестам, не по внешним спискам.\n\n"
+            "✕ НЕ работает (проверено): EOS R6 Mark II, EOS R10 — карта читается камерой "
+            "(мигает индикатор), но файл результата не появляется ни при каком числе "
+            "нажатий SET. Для них — вкладка «USB».\n\n"
+            "? Не проверено нами: EOS R, Ra, RP, R3, R5, R5 C, R5 Mark II, R7, R8, R6 Mark III "
+            "— упомянуты «подходящими» во внешнем проекте shutter-check-canon, но его автор "
+            "лично подтвердил метод только на базовой EOS R.",
+            header="ℹ️  Совместимость метода с камерами",
+            lead="✓ Подтверждено работает: EOS R6 (первая версия, без Mark)",
+        )
+
+        steps_link = tk.Label(
+            header_row, text="  ·  Как подготовить карту (3 шага) ℹ️",
+            bg=self.CARD, fg=self.ACCENT, font=(self.FONT_FAMILY, 8, "underline"), cursor="hand2"
+        )
+        steps_link.pack(side="left")
+        self.attach_tip(
+            steps_link,
+            "1. Флешка ≤32 ГБ, пустая (сотрётся).\n"
+            "2. «Форматировать и подготовить карту» — программа форматирует и сама пишет скрипт.\n"
+            "3. Карту — в камеру → Play → несколько раз SET → выключить, вынуть.\n"
+            "4. Карту — обратно в компьютер → «Прочитать результат».",
+            header="ℹ️  Как подготовить карту",
+            lead="Флешка → формат (пишется скрипт) → в камеру, Play+SET → обратно → прочитать",
+        )
+
+        info_text = (
+            "Штатная функция камеры (не USB). Работает: EOS R6 (без Mark). Не работает: "
+            "R6 Mark II, R10 (вкладка «USB»). Подробности в подсказках выше ↑"
+        )
+        tk.Label(
+            info_inner, text=info_text, bg=self.CARD, fg=self.MUTED,
+            font=(self.FONT_FAMILY, 8), justify="left", anchor="w", wraplength=790
+        ).pack(fill="x")
+
+        # 2. Карточка выбора карты и действий
+        action_card = tk.Frame(page, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, bd=0)
+        action_card.pack(fill="x", pady=(0, 6))
+        action_inner = tk.Frame(action_card, bg=self.CARD)
+        action_inner.pack(fill="x", padx=16, pady=8)
+
+        drive_row = tk.Frame(action_inner, bg=self.CARD)
+        drive_row.pack(fill="x", pady=(0, 6))
+
+        tk.Label(drive_row, text="Карта памяти:", bg=self.CARD, fg=self.TEXT, font=(self.FONT_FAMILY, 9)).pack(side="left")
+
+        self.card_drive_var = tk.StringVar(value="")
+        self.card_drive_combo = ttk.Combobox(drive_row, textvariable=self.card_drive_var, state="readonly", width=40)
+        self.card_drive_combo.pack(side="left", padx=(8, 8))
+        self.attach_tip(
+            self.card_drive_combo,
+            "Жёсткие и системные диски намеренно скрыты, чтобы нельзя было случайно "
+            "выбрать не тот диск. Нет нужной карты в списке? Вставьте её и нажмите "
+            "«Обновить список».",
+            header="ℹ️  Выбор карты",
+            lead="Показаны ТОЛЬКО съёмные устройства (карты, флешки)",
+        )
+
+        self.card_drives_map: dict[str, cbasic_card.RemovableDrive] = {}
+
+        refresh_btn = tk.Button(
+            drive_row, text="Обновить список", command=self.refresh_card_drives,
+            padx=10, pady=4, font=(self.FONT_FAMILY, 8)
+        )
+        self.style_button(refresh_btn, bg=self.GRAY_BTN, hover_bg=self.GRAY_BTN_HOVER, fg=self.GRAY_BTN_FG)
+        refresh_btn.pack(side="left")
+        self.attach_tip(
+            refresh_btn,
+            "Перечитывает список подключённых съёмных дисков — нажмите после того, как "
+            "вставили или вынули карту/флешку.",
+            header="ℹ️  Обновить список",
+        )
+
+        tk.Label(drive_row, text="  Метка камеры:", bg=self.CARD, fg=self.TEXT, font=(self.FONT_FAMILY, 9)).pack(side="left", padx=(10, 0))
+        self.card_label_var = tk.StringVar(value="")
+        card_label_entry = tk.Entry(
+            drive_row, textvariable=self.card_label_var, width=16,
+            bg=self.BG, fg=self.TEXT, insertbackground=self.TEXT, relief="flat"
+        )
+        card_label_entry.pack(side="left", padx=(6, 0))
+        self.attach_tip(
+            card_label_entry,
+            "CAM_INFO.XML не содержит название модели камеры (только серийный номер и "
+            "прошивку) — программа не может подставить модель сама, не придумывая её. "
+            "Впишите сюда, какая это камера (например «EOS R6 №1» или «запасная тушка»), "
+            "и подпись попадёт в окно результата и в сохранённый отчёт. Необязательно.",
+            header="ℹ️  Метка камеры",
+        )
+
+        self.card_status_lbl = tk.Label(
+            action_inner, text="Выберите только СЪЁМНЫЙ диск (карту/флешку) — список показывает лишь их.",
+            bg=self.CARD, fg=self.SUBTLE, font=(self.FONT_FAMILY, 8), justify="left", anchor="w", wraplength=790
+        )
+        self.card_status_lbl.pack(fill="x", pady=(0, 6))
+
+        btn_row = tk.Frame(action_inner, bg=self.CARD)
+        btn_row.pack(fill="x")
+
+        format_btn = tk.Button(
+            btn_row, text="Форматировать и подготовить карту", command=self.on_card_format,
+            padx=12, pady=7, font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.style_button(format_btn, bg=self.ACCENT, hover_bg=self.ACCENT_HOVER, fg="#FFFFFF")
+        format_btn.pack(side="left", padx=(0, 8))
+        self.attach_tip(
+            format_btn,
+            "Используйте отдельную карту ≤32 ГБ, на которой нет ничего нужного. Программа "
+            "сама отформатирует её в FAT32, запишет метку SCRIPT в загрузочный сектор и "
+            "файлы extend.m/script.req.",
+            header="⚠️  Форматирование карты",
+            lead="Полностью стирает карту безвозвратно",
+        )
+
+        read_btn = tk.Button(
+            btn_row, text="Прочитать результат", command=self.on_card_read,
+            padx=12, pady=7, font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.style_button(read_btn, bg=self.ACCENT, hover_bg=self.ACCENT_HOVER, fg="#FFFFFF")
+        read_btn.pack(side="left", padx=(0, 8))
+        self.attach_tip(
+            read_btn,
+            "Ищет на выбранной карте файл CAM_INFO.XML (его камера создаёт сама после "
+            "запуска скрипта через Play → SET) и показывает счётчик затвора и журнал "
+            "ошибок из него. Если файла нет — выполните шаг на камере (Play → SET) ещё раз.",
+            header="ℹ️  Чтение результата",
+        )
+
+        self.card_save_btn = tk.Button(
+            btn_row, text="Сохранить отчёт…", command=self.save_card_report,
+            padx=12, pady=7, font=(self.FONT_FAMILY, 9), state="disabled"
+        )
+        self.style_button(self.card_save_btn, bg=self.GRAY_BTN, hover_bg=self.GRAY_BTN_HOVER, fg=self.GRAY_BTN_FG)
+        self.card_save_btn.pack(side="left")
+        self.attach_tip(
+            self.card_save_btn,
+            "Сохраняет человекочитаемый текстовый отчёт (.txt) со всеми параметрами "
+            "из CAM_INFO.XML — серийный номер, прошивка, счётчик затвора, наработка и "
+            "журнал ошибок. Становится доступно после успешного чтения результата.\n\n"
+            "Нужен только кусок текста — его можно выделить мышью прямо в поле "
+            "результата ниже и скопировать как обычно (Ctrl+C).",
+            header="ℹ️  Сохранить отчёт",
+        )
+
+        # 3. Карточка результата — занимает всю оставшуюся высоту окна
+        result_card = tk.Frame(page, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, bd=0)
+        result_card.pack(fill="both", expand=True)
+        result_inner = tk.Frame(result_card, bg=self.CARD)
+        result_inner.pack(fill="both", expand=True, padx=16, pady=12)
+
+        tk.Label(
+            result_inner, text="РЕЗУЛЬТАТ",
+            bg=self.CARD, fg=self.MUTED, font=(self.FONT_FAMILY, 8, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.card_result_text = tk.Text(
+            result_inner, bg=self.BG, fg=self.TEXT, font=(self.FONT_FAMILY, 9),
+            relief="flat", wrap="word"
+        )
+        self.card_result_text.pack(fill="both", expand=True)
+        self.make_text_readonly_but_selectable(self.card_result_text)
+
+        self.refresh_card_drives()
+
+    def refresh_card_drives(self) -> None:
+        self.card_drives_map.clear()
+        drives = cbasic_card.list_removable_drives()
+        values = []
+        for d in drives:
+            disp = d.display()
+            self.card_drives_map[disp] = d
+            values.append(disp)
+        self.card_drive_combo["values"] = values
+        if values:
+            self.card_drive_combo.current(0)
+        else:
+            self.card_drive_var.set("")
+            self.card_drive_combo.set("")
+
+    def _get_selected_card_drive(self):
+        return self.card_drives_map.get(self.card_drive_var.get())
+
+    def on_card_format(self) -> None:
+        drive = self._get_selected_card_drive()
+        if not drive:
+            messagebox.showinfo(APP_TITLE, "Сначала выберите карту памяти из списка.")
+            return
+
+        confirmed = messagebox.askyesno(
+            APP_TITLE,
+            f"Карта {drive.letter}  «{drive.label or 'без метки'}»  ({drive.size_gb} ГБ) "
+            "будет ПОЛНОСТЬЮ СТЁРТА и отформатирована в FAT32.\n\n"
+            "Все файлы, которые сейчас есть на этой карте, будут потеряны безвозвратно.\n\n"
+            "Продолжить?",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+
+        self.card_status_lbl.config(text="Форматирование карты, подождите…", fg=self.MUTED)
+        self.card_status_lbl.update_idletasks()
+
+        ok, msg = cbasic_card.format_and_prepare_card(drive)
+        if ok:
+            self.card_status_lbl.config(text=f"✓ {msg}", fg=self.STATUS_FG_OK)
+        else:
+            self.card_status_lbl.config(text=f"✕ {msg}", fg=self.STATUS_FG_ERR)
+        self.refresh_card_drives()
+
+    @staticmethod
+    def _fmt_n(n) -> str:
+        return f"{n:,}".replace(",", " ") if isinstance(n, int) else "—"
+
+    @staticmethod
+    def _fmt_errors_summary(errors: list[dict]) -> str:
+        if not errors:
+            return "нет"
+        total = sum(e.get("count", 0) for e in errors)
+        parts = "; ".join(f"{e['code']}×{e.get('count', 0)}" for e in errors)
+        return f"{total}  ({parts})"
+
+    def _build_card_result_lines(self, data: dict) -> list[str]:
+        """Компактная сводка для окна результата — фиксированные строки,
+        без построчного списка ошибок (длинная таблица не помещается в
+        маленькое окно программы)."""
+        lines = []
+        label = (data.get("user_label") or "").strip()
+        head = (f"{label}  ·  " if label else "") + (data.get("serial") or "серийный номер —")
+        if data.get("firmware"):
+            head += f"  ·  прошивка {data['firmware']}"
+        lines.append(f"Камера: {head}")
+        if not label:
+            lines.append("(модель не подписана — в CAM_INFO.XML её нет, впишите в поле «Метка камеры»)")
+        lines.append("")
+        lines.append(f"Механический затвор (TotalShutter): {self._fmt_n(data.get('total_shutter'))}")
+        lines.append(f"Всего кадров, мех.+электр. (TotalShoot): {self._fmt_n(data.get('total_shoot'))}")
+
+        usb_val = (self.usb_data or {}).get("shutter_mechanical") if hasattr(self, "usb_data") else None
+        if isinstance(usb_val, int) and isinstance(data.get("total_shutter"), int):
+            diff = data["total_shutter"] - usb_val
+            lines.append(f"Значение по USB (0x12000001): {self._fmt_n(usb_val)}  (разница: {diff:+d})")
+
+        lines.append(f"Включений камеры (PowerOnCount): {self._fmt_n(data.get('power_on_count'))}")
+        rt = data.get("total_running_time")
+        if rt and rt.isdigit():
+            lines.append(f"Наработка (TotalRunningTime): {self._fmt_n(int(rt))} с  (~{int(rt) // 3600} ч)")
+        elif rt:
+            lines.append(f"Наработка (TotalRunningTime): {rt}")
+
+        lines.append("")
+        lines.append(f"Ошибок в журнале камеры: {self._fmt_errors_summary(data.get('errors') or [])}")
+        return lines
+
+    def on_card_read(self) -> None:
+        drive = self._get_selected_card_drive()
+        if not drive:
+            messagebox.showinfo(APP_TITLE, "Сначала выберите карту памяти из списка.")
+            return
+        xml_path = cbasic_card.find_cam_info_xml(drive)
+        if not xml_path:
+            self.card_status_lbl.config(
+                text="Файл CAM_INFO.XML не найден на карте. Выполните шаг 3 на камере.",
+                fg=self.STATUS_FG_ERR
+            )
+            return
+        data = cbasic_card.parse_cam_info_xml(xml_path)
+        if data.get("parse_error"):
+            self.card_status_lbl.config(text=f"✕ Ошибка разбора файла: {data['parse_error']}", fg=self.STATUS_FG_ERR)
+            return
+
+        # Метка камеры — то, что пользователь вписал сам (в XML названия модели нет).
+        data["user_label"] = self.card_label_var.get().strip()
+
+        lines = self._build_card_result_lines(data)
+        self.card_result_text.delete("1.0", "end")
+        self.card_result_text.insert("1.0", "\n".join(lines))
+        self.card_status_lbl.config(text="✓ Файл прочитан.", fg=self.TEXT)
+
+        # Запоминаем для кнопки «Сохранить отчёт…»
+        self.card_last_data = data
+        self.card_last_xml_path = xml_path
+        self.card_save_btn.config(state="normal")
+
+    def _build_card_report_text(self, data: dict, xml_path) -> str:
+        """Полный человекочитаемый .txt-отчёт (для сохранения на диск) —
+        в отличие от окна программы, сюда помещается развёрнутый журнал
+        ошибок построчно."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        L = []
+        L.append("OpenEOS — отчёт о счётчике затвора (метод CamInfo_Debug / SD-карта)")
+        L.append("=" * 72)
+        L.append(f"Сформирован: {now}")
+        L.append(f"Источник: {xml_path}")
+        L.append("")
+        L.append("КАМЕРА")
+        L.append("-" * 72)
+        label = (data.get("user_label") or "").strip()
+        L.append(f"Метка (вписана вручную):  {label or '— не указана —'}")
+        L.append(f"Серийный номер:        {data.get('serial') or '—'}")
+        L.append(f"Прошивка:              {data.get('firmware') or '—'}")
+        if not label:
+            L.append("")
+            L.append("Примечание: CAM_INFO.XML не содержит название модели камеры (только серийный")
+            L.append("номер и прошивку) — программа не может подставить модель сама, не придумывая её.")
+        L.append("")
+        L.append("СЧЁТЧИКИ")
+        L.append("-" * 72)
+        L.append(f"Механический затвор (TotalShutter):      {self._fmt_n(data.get('total_shutter'))}")
+        L.append(f"Всего кадров, мех.+электр. (TotalShoot):  {self._fmt_n(data.get('total_shoot'))}")
+        L.append(f"Включений камеры (PowerOnCount):          {self._fmt_n(data.get('power_on_count'))}")
+        rt = data.get("total_running_time")
+        if rt and rt.isdigit():
+            L.append(f"Наработка (TotalRunningTime):             {self._fmt_n(int(rt))} с  (~{int(rt) // 3600} ч)")
+        elif rt:
+            L.append(f"Наработка (TotalRunningTime):             {rt}")
+        usb_val = (self.usb_data or {}).get("shutter_mechanical") if hasattr(self, "usb_data") else None
+        if isinstance(usb_val, int) and isinstance(data.get("total_shutter"), int):
+            diff = data["total_shutter"] - usb_val
+            L.append("")
+            L.append(f"Для сравнения, значение по USB (0x12000001): {self._fmt_n(usb_val)}  (разница: {diff:+d})")
+        L.append("")
+        L.append("ЖУРНАЛ ОШИБОК КАМЕРЫ")
+        L.append("-" * 72)
+        errors = data.get("errors") or []
+        if errors:
+            for e in errors:
+                name = f" — {e['name']}" if e.get("name") else ""
+                L.append(f"  {e['code']}{name}: {e.get('count', 0)} раз")
+        else:
+            L.append("  Ошибок нет.")
+        L.append("")
+        L.append("=" * 72)
+        L.append("Отчёт сформирован автоматически программой OpenEOS по данным,")
+        L.append("которые камера сама записала в CAM_INFO.XML (штатная функция")
+        L.append("Canon CamInfo_Debug). Ничего не записывалось в камеру.")
+        return "\n".join(L)
+
+    def save_card_report(self) -> None:
+        data = getattr(self, "card_last_data", None)
+        xml_path = getattr(self, "card_last_xml_path", None)
+        if not data:
+            messagebox.showinfo(APP_TITLE, "Сначала нажмите «Прочитать результат».")
+            return
+
+        report_text = self._build_card_report_text(data, xml_path)
+        label = re.sub(r"[^A-Za-zА-Яа-я0-9_-]+", "_", (data.get("user_label") or "").strip()).strip("_")
+        serial = (data.get("serial") or "unknown").replace(" ", "_")
+        name_part = f"{label}_{serial}" if label else serial
+        default_name = f"OpenEOS_shutter_report_{name_part}_{datetime.now().strftime('%Y%m%d')}.txt"
+
+        path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Текстовый отчёт", "*.txt"), ("Все файлы", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report_text)
+            messagebox.showinfo(APP_TITLE, f"Отчёт успешно сохранён:\n{path}")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Не удалось сохранить файл:\n{str(exc)}")
+
+    # ---------------------------------------------------------------------------
+    # Вкладка 1: Проверить фото (Single file)
+    # ---------------------------------------------------------------------------
+    def create_single_tab(self) -> None:
+        page = tk.Frame(self.single_tab, bg=self.BG)
+        page.pack(fill="x", padx=24, pady=(2, 6))
+
+        self.drop_card = tk.Frame(
+            page, bg=self.CARD, highlightbackground=self.BORDER,
+            highlightthickness=1, bd=0
+        )
+        self.drop_card.pack(fill="x", pady=(0, 8))
+
+        drop_inner = tk.Frame(
+            self.drop_card, bg=self.ACCENT_BG,
+            highlightbackground=self.ACCENT_BORDER, highlightthickness=1
+        )
+        drop_inner.pack(fill="x", padx=12, pady=10)
+
+        tk.Label(
+            drop_inner, text="📷", bg=self.ACCENT_BG, fg=self.TEXT,
+            font=(self.FONT_FAMILY, 22)
+        ).pack(pady=(2, 1))
+
+        prompt = "Перетащите фото в эту область или выберите файл" if DND_AVAILABLE else "Выберите файл кнопкой ниже"
+        tk.Label(
+            drop_inner, text=prompt, bg=self.ACCENT_BG, fg=self.TEXT,
+            font=(self.FONT_FAMILY, 11, "bold")
+        ).pack(pady=(0, 2))
+
+        tk.Label(
+            drop_inner, text=SUPPORTED_FORMATS_LABEL,
+            bg=self.ACCENT_BG, fg=self.MUTED, font=(self.FONT_FAMILY, 8, "bold")
+        ).pack(pady=(0, 6))
+
+        self.single_select_button = tk.Button(
+            drop_inner, text="Выбрать файл…", command=self.select_single_file,
+            padx=24, pady=6
+        )
+        self.style_button(
+            self.single_select_button,
+            bg=self.ACCENT, hover_bg=self.ACCENT_HOVER, fg="#FFFFFF",
+            font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.single_select_button.pack(pady=(0, 3))
+
+        self.selected_file_label = tk.Label(
+            drop_inner, text="Файл не выбран", bg=self.ACCENT_BG,
+            fg=self.MUTED, font=(self.FONT_FAMILY, 9), anchor="center"
+        )
+        self.selected_file_label.pack(pady=(1, 2))
+
+        self.result_card = tk.Frame(
+            page, bg=self.CARD, highlightbackground=self.BORDER,
+            highlightthickness=1, bd=0
+        )
+        self.result_card.pack(fill="x")
+
+        tk.Label(
+            self.result_card, text="ПОКАЗАНИЕ СЧЁТЧИКА ЗАТВОРА В ФАЙЛЕ",
+            bg=self.CARD, fg=self.MUTED, font=(self.FONT_FAMILY, 9, "bold")
+        ).pack(pady=(12, 2))
+
+        value_row = tk.Frame(self.result_card, bg=self.CARD)
+        value_row.pack(anchor="center", pady=(1, 4))
+
+        self.counter_label = tk.Label(
+            value_row, text="—", bg=self.CARD, fg=self.TEXT,
+            font=(self.FONT_FAMILY, 44, "bold")
+        )
+        self.counter_label.pack(side="left", padx=(0, 14))
+
+        self.single_status_label = tk.Label(
+            value_row, text="●  Ожидает фото", bg=self.STATUS_BG_IDLE, fg=self.STATUS_FG_IDLE,
+            font=(self.FONT_FAMILY, 9, "bold"), padx=10, pady=4
+        )
+        self.single_status_label.pack(side="left", pady=(10, 0))
+
+        tk.Frame(self.result_card, bg=self.BORDER, height=1).pack(fill="x", padx=24, pady=(4, 8))
+
+        meta_frame = tk.Frame(self.result_card, bg=self.CARD)
+        meta_frame.pack(fill="x", padx=24, pady=(0, 14))
+        meta_frame.columnconfigure(0, weight=1)
+        meta_frame.columnconfigure(1, weight=1)
+        meta_frame.columnconfigure(2, weight=1)
+
+        self.single_meta = {}
+        for col, (label, key) in enumerate((
+            ("КАМЕРА", "model"),
+            ("ДАТА СЪЁМКИ", "date"),
+            ("РЕСУРС ЗАТВОРА", "rating"),
+        )):
+            cell = tk.Frame(meta_frame, bg=self.CARD)
+            cell.grid(row=0, column=col, sticky="nsew", padx=8)
+
+            header_box = tk.Frame(cell, bg=self.CARD)
+            header_box.pack(anchor="center")
+
+            tk.Label(
+                header_box, text=label, bg=self.CARD, fg=self.MUTED,
+                font=(self.FONT_FAMILY, 9, "bold")
+            ).pack(side="left")
+
+            if key == "rating":
+                rating_info = tk.Label(
+                    header_box, text=" (?)", bg=self.CARD, fg=self.MUTED,
+                    font=(self.FONT_FAMILY, 8, "bold"), cursor="hand2"
+                )
+                rating_info.pack(side="left")
+                self.style_tooltip_button(rating_info)
+
+            value = tk.Label(
+                cell, text="—", bg=self.CARD, fg=self.TEXT,
+                font=(self.FONT_FAMILY, 11, "bold"), anchor="center"
+            )
+            value.pack(fill="x", pady=(4, 0))
+            self.single_meta[key] = value
+
+    def register_drop_targets(self, widget: tk.Widget) -> None:
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self.on_file_drop)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def on_file_drop(self, event: tk.Event) -> str:
+        if self.busy:
+            return "break"
+
+        try:
+            dropped_paths = list(self.root.tk.splitlist(event.data))
+        except (tk.TclError, TypeError):
+            dropped_paths = [str(getattr(event, "data", ""))]
+
+        dropped_paths = list(dict.fromkeys(os.path.normpath(p.strip()) for p in dropped_paths if p.strip()))
+        existing_files = [path for path in dropped_paths if os.path.isfile(path)]
+        existing_dirs = [path for path in dropped_paths if os.path.isdir(path)]
+
+        supported_files = [
+            path for path in existing_files
+            if os.path.splitext(path)[1].lower() in SUPPORTED_EXTENSIONS
+        ]
+
+        if supported_files:
+            if self.current_tab_index != 0:
+                self.switch_tab(0)
+            self.start_single_file(supported_files[0])
+            return "break"
+
+        if existing_dirs:
+            self.switch_tab(1)
+            self.set_folder_path(existing_dirs[0])
+            return "break"
+
+        if existing_files:
+            extensions = ", ".join(
+                sorted({os.path.splitext(path)[1] or "без расширения" for path in existing_files})
+            )
+            messagebox.showwarning(
+                "OpenEOS — формат не поддерживается",
+                "Этот формат не входит в список поддерживаемых OpenEOS.\n\n"
+                f"Получено: {extensions}\n\n"
+                f"Поддерживаются: {SUPPORTED_FORMATS_LABEL.replace('·', ', ')}"
+            )
+        return "break"
+
+    def select_single_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Выберите фотографию", filetypes=SUPPORTED_FILETYPES
+        )
+        if path:
+            self.start_single_file(path)
+
+    def check_exiftool(self, show_message: bool = False) -> bool:
+        version = self.get_exiftool_version()
+        if version != "Не удалось определить":
+            return True
+        if show_message:
+            self.show_error("ExifTool не найден. Проверьте установку ExifTool.")
+        return False
+
+    def read_single_file(self, path: str) -> dict:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        command = [
+            *EXIFTOOL_CMD,
+            "-json", "-fast2", "-charset", "filename=utf8",
+            "-ShutterCount", "-Track4:ShutterCount", "-Canon:ShutterCount",
+            "-Nikon:ShutterCount", "-Sony:ShutterCount", "-Fuji:ShutterCount",
+            "-Model", "-DateTimeOriginal",
+            path
+        ]
+        result = subprocess.run(
+            command, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", creationflags=creationflags,
+            env=EXIFTOOL_ENV, cwd=EXIFTOOL_CWD,
+        )
+        if result.returncode != 0:
+            error_message = (result.stderr or result.stdout or "Ошибка запуска ExifTool").strip()
+            raise RuntimeError(error_message)
+
+        data = json.loads(result.stdout)
+        if not data:
+            return {}
+        return self.normalise_record(data[0], path)
+
+    @staticmethod
+    def normalise_record(record: dict, fallback_path: str = "") -> dict:
+        shutter = None
+        counter_tag = None
+        for tag in (
+            "ShutterCount", "Track4:ShutterCount", "Canon:ShutterCount",
+            "Nikon:ShutterCount", "Sony:ShutterCount", "Fuji:ShutterCount"
+        ):
+            value = record.get(tag)
+            if value is not None and str(value).strip() != "":
+                clean = re.sub(r"[^\d]", "", str(value))
+                if clean:
+                    shutter = int(clean)
+                    counter_tag = tag
+                    break
+
+        raw_source = record.get("SourceFile") or fallback_path
+        normalized_path = os.path.normpath(raw_source) if raw_source else ""
+
+        return {
+            "FileName": record.get("FileName") or (os.path.basename(normalized_path) if normalized_path else ""),
+            "Directory": record.get("Directory") or (os.path.dirname(normalized_path) if normalized_path else ""),
+            "SourceFile": normalized_path,
+            "Model": record.get("Model"),
+            "DateTimeOriginal": record.get("DateTimeOriginal"),
+            "ShutterCount": shutter,
+            "CounterTag": counter_tag,
+            "ProcessingError": record.get("ProcessingError", ""),
+        }
+
+    def start_single_file(self, path: str) -> None:
+        if self.busy:
+            return
+        extension = os.path.splitext(path)[1].lower()
+        if extension not in SUPPORTED_EXTENSIONS:
+            messagebox.showwarning(
+                "OpenEOS — формат не поддерживается",
+                "Выберите файл в одном из поддерживаемых форматов:\n\n"
+                f"{SUPPORTED_FORMATS_LABEL.replace('·', ', ')}"
+            )
+            return
+        if not self.check_exiftool(show_message=True):
+            return
+
+        self.single_file = path
+        self.counter_label.config(text="…")
+        self.set_single_status("⏳  Читаем…", self.ACCENT_BG, self.ACCENT)
+        self.selected_file_label.config(
+            text="📄  " + self.compact_text(os.path.basename(path), 92), fg=self.TEXT
+        )
+        self.single_meta["model"].config(text="—")
+        self.single_meta["date"].config(text="—")
+        self.single_meta["rating"].config(text="—")
+        self.set_busy(True, "single")
+        threading.Thread(
+            target=self.single_worker, args=(path,), daemon=True
+        ).start()
+
+    def set_single_status(self, text: str, background: str, foreground: str) -> None:
+        self.single_status_label.config(text=text, bg=background, fg=foreground)
+
+    def single_worker(self, path: str) -> None:
+        try:
+            data = self.read_single_file(path)
+        except Exception as exc:
+            self.root.after(0, self.finish_single_error, str(exc))
+        else:
+            self.root.after(0, self.finish_single_success, data, path)
+
+    def finish_single_success(self, data: dict, path: str) -> None:
+        try:
+            if not data:
+                raise RuntimeError("ExifTool не вернул данные по выбранному файлу.")
+            self.last_single_data = data
+            shutter = data.get("ShutterCount")
+            if shutter is None:
+                self.counter_label.config(text="Не найден")
+                self.set_single_status(
+                    "●  Счётчик не найден", self.STATUS_BG_WARN, self.STATUS_FG_WARN
+                )
+            else:
+                formatted = f"{int(shutter):,}".replace(",", " ") if str(shutter).isdigit() else str(shutter)
+                self.counter_label.config(text=formatted)
+                self.set_single_status("●  Готово", self.STATUS_BG_OK, self.STATUS_FG_OK)
+
+            model_name = data.get("Model") or ""
+            self.single_meta["model"].config(
+                text=self.compact_text(model_name or "Не определена", 28)
+            )
+            self.single_meta["date"].config(
+                text=format_display_date(data.get("DateTimeOriginal"))
+            )
+
+            rating = get_camera_rating(model_name)
+            if rating:
+                rating_str = f"~{rating:,} кадров".replace(",", " ")
+                self.single_meta["rating"].config(text=rating_str)
+            else:
+                self.single_meta["rating"].config(text="Не заявлен")
+
+        except Exception as exc:
+            self.finish_single_error(str(exc))
+            return
+        self.set_busy(False)
+
+    def finish_single_error(self, message: str) -> None:
+        self.set_busy(False)
+        self.counter_label.config(text="—")
+        self.set_single_status("✕  Ошибка чтения", self.STATUS_BG_ERR, self.STATUS_FG_ERR)
+        self.single_meta["rating"].config(text="—")
+        self.show_error(message)
+
+    # ---------------------------------------------------------------------------
+    # Вкладка 2: Анализ папки (Batch)
+    # ---------------------------------------------------------------------------
+    def create_batch_tab(self) -> None:
+        page = tk.Frame(self.batch_tab, bg=self.BG)
+        page.pack(fill="both", expand=True, padx=24, pady=(2, 16))
+
+        folder_card = tk.Frame(
+            page, bg=self.CARD, highlightbackground=self.BORDER,
+            highlightthickness=1, bd=0
+        )
+        folder_card.pack(fill="x", pady=(0, 10))
+
+        folder_row = tk.Frame(folder_card, bg=self.CARD)
+        folder_row.pack(fill="x", padx=14, pady=10)
+
+        tk.Label(
+            folder_row, text="ПАПКА", bg=self.CARD, fg=self.MUTED,
+            font=(self.FONT_FAMILY, 7, "bold")
+        ).pack(side="left", padx=(0, 12))
+
+        self.folder_value = tk.Label(
+            folder_row, textvariable=self.folder_text, bg=self.BG,
+            fg=self.TEXT, anchor="w", padx=10, pady=7,
+            font=(self.FONT_FAMILY, 9)
+        )
+        self.folder_value.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        self.batch_select_button = tk.Button(
+            folder_row, text="Выбрать папку…", command=self.select_batch_folder,
+            padx=14, pady=7
+        )
+        self.style_button(
+            self.batch_select_button,
+            bg=self.GRAY_BTN, hover_bg=self.GRAY_BTN_HOVER, fg=self.GRAY_BTN_FG,
+            font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.batch_select_button.pack(side="right")
+
+        actions = tk.Frame(page, bg=self.BG)
+        actions.pack(fill="x", pady=(0, 10))
+
+        self.batch_analyze_button = tk.Button(
+            actions, text="Анализировать папку", command=self.analyze_batch,
+            padx=18, pady=8
+        )
+        self.style_button(
+            self.batch_analyze_button,
+            bg=self.ACCENT, hover_bg=self.ACCENT_HOVER, fg="#FFFFFF",
+            font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.batch_analyze_button.pack(side="left")
+
+        self.csv_button = tk.Button(
+            actions, text="Экспорт CSV…", command=self.export_csv,
+            padx=14, pady=8, state="disabled"
+        )
+        self.style_button(
+            self.csv_button,
+            bg=self.GRAY_BTN, hover_bg=self.GRAY_BTN_HOVER, fg=self.GRAY_BTN_FG,
+            font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.csv_button.pack(side="left", padx=(8, 0))
+
+        self.cancel_button = tk.Button(
+            actions, text="Прервать анализ", command=self.cancel_batch,
+            padx=14, pady=8, state="disabled"
+        )
+        self.style_button(
+            self.cancel_button,
+            bg=self.STATUS_BG_ERR, hover_bg=self.RED_BTN_HOVER, fg=self.STATUS_FG_ERR,
+            font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.cancel_button.pack(side="right")
+
+        progress_card = tk.Frame(
+            page, bg=self.CARD, highlightbackground=self.BORDER,
+            highlightthickness=1, bd=0
+        )
+        progress_card.pack(fill="x", pady=(0, 10))
+
+        progress_inner = tk.Frame(progress_card, bg=self.CARD)
+        progress_inner.pack(fill="x", padx=14, pady=8)
+
+        progress_top = tk.Frame(progress_inner, bg=self.CARD)
+        progress_top.pack(fill="x", pady=(0, 4))
+
+        tk.Label(
+            progress_top, text="Ход анализа", bg=self.CARD,
+            fg=self.TEXT, font=(self.FONT_FAMILY, 9, "bold")
+        ).pack(side="left")
+
+        self.progress_percent = tk.Label(
+            progress_top, text="0%", bg=self.CARD, fg=self.ACCENT,
+            font=(self.FONT_FAMILY, 9, "bold")
+        )
+        self.progress_percent.pack(side="right")
+
+        self.progress_canvas = tk.Canvas(
+            progress_inner, height=8, bg=self.PROG_BG,
+            highlightthickness=0, bd=0
+        )
+        self.progress_canvas.pack(fill="x", pady=(2, 4))
+        self.progress_fill = self.progress_canvas.create_rectangle(
+            0, 0, 0, 8, fill=self.ACCENT, outline=""
+        )
+        self.progress_canvas.bind("<Configure>", self.redraw_progress)
+
+        self.batch_progress_label = tk.Label(
+            progress_inner, text="Ожидает запуска.", bg=self.CARD,
+            fg=self.MUTED, anchor="w", font=(self.FONT_FAMILY, 8)
+        )
+        self.batch_progress_label.pack(fill="x", pady=(2, 1))
+
+        self.batch_summary = tk.Label(
+            progress_inner, text="Результатов пока нет.", bg=self.CARD,
+            fg=self.MUTED, anchor="w", font=(self.FONT_FAMILY, 8, "bold")
+        )
+        self.batch_summary.pack(fill="x")
+
+        table_card = tk.Frame(
+            page, bg=self.CARD, highlightbackground=self.BORDER,
+            highlightthickness=1, bd=0
+        )
+        table_card.pack(fill="both", expand=True)
+
+        table_inner = tk.Frame(table_card, bg=self.CARD)
+        table_inner.pack(fill="both", expand=True, padx=4, pady=4)
+
+        columns = ("filename", "shutter", "date", "model", "observations", "path")
+        self.batch_table = ttk.Treeview(
+            table_inner, columns=columns, show="headings"
+        )
+        headings = {
+            "filename": "Файл", "shutter": "ShutterCount",
+            "date": "Дата съёмки", "model": "Камера",
+            "observations": "Примечания", "path": "Полный путь"
+        }
+        widths = {
+            "filename": 160, "shutter": 110, "date": 160,
+            "model": 130, "observations": 180, "path": 340
+        }
+        for col in columns:
+            self.batch_table.heading(
+                col, text=headings[col],
+                command=lambda column=col: self.sort_batch_table(column, False)
+            )
+            self.batch_table.column(
+                col, width=widths[col], anchor="center" if col in ("shutter", "date") else "w"
+            )
+
+        scroll_y = ttk.Scrollbar(
+            table_inner, orient="vertical", command=self.batch_table.yview,
+            style="Vertical.TScrollbar"
+        )
+        scroll_x = ttk.Scrollbar(
+            table_inner, orient="horizontal", command=self.batch_table.xview,
+            style="Horizontal.TScrollbar"
+        )
+        self.batch_table.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
+        self.batch_table.grid(row=0, column=0, sticky="nsew")
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
+
+        table_inner.rowconfigure(0, weight=1)
+        table_inner.columncase = False
+        table_inner.columnconfigure(0, weight=1)
+
+    def redraw_progress(self, _event=None) -> None:
+        width = self.progress_canvas.winfo_width()
+        current = getattr(self, "progress_ratio", 0.0)
+        self.progress_canvas.coords(self.progress_fill, 0, 0, int(width * current), 8)
+
+    def set_progress(self, current: int, total: int) -> None:
+        ratio = current / total if total > 0 else 0.0
+        self.progress_ratio = max(0.0, min(1.0, ratio))
+        self.progress_percent.config(text=f"{int(self.progress_ratio * 100)}%")
+        self.redraw_progress()
+
+    def set_folder_path(self, folder: str) -> None:
+        self.batch_folder_path = folder
+        self.folder_text.set(self.compact_text(folder, 80))
+        self.batch_summary.config(text="Папка выбрана. Нажмите «Анализировать папку».")
+        self.batch_progress_label.config(text="Готово к запуску.")
+        self.csv_button.config(state="disabled")
+
+    def select_batch_folder(self) -> None:
+        if self.busy:
+            return
+        folder = filedialog.askdirectory(title="Выберите папку с RAW-файлами")
+        if folder:
+            self.set_folder_path(folder)
+
+    def analyze_batch(self) -> None:
+        folder = self.batch_folder_path
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("OpenEOS", "Сначала выберите папку.")
+            return
+        if self.busy:
+            return
+        if not self.check_exiftool(show_message=True):
+            return
+
+        self.batch_cancel_event = threading.Event()
+        self.batch_results = []
+        self.batch_metadata = {}
+        self.batch_total = 0
+        self.batch_processed = 0
+        self.batch_started_at = time.monotonic()
+        self.batch_cancelled = False
+        self.set_busy(True, "batch")
+        self.set_progress(0, 0)
+        self.batch_progress_label.config(text="Поиск файлов в папке…")
+        self.batch_summary.config(text="Подготовка списка файлов.")
+        threading.Thread(
+            target=self.batch_worker, args=(folder,), daemon=True
+        ).start()
+
+    def batch_worker(self, folder: str) -> None:
+        started = time.monotonic()
+        results: list[dict] = []
+        warnings: list[str] = []
+        warnings_lock = threading.Lock()
+        files: list[str] = []
+        attempted = 0
+        cancelled = False
+        error_message: str | None = None
+        process: subprocess.Popen | None = None
+        stderr_thread: threading.Thread | None = None
+
+        def drain_stderr(stderr_pipe):
+            try:
+                for line in stderr_pipe:
+                    line = line.strip()
+                    if line:
+                        with warnings_lock:
+                            warnings.append(line)
+                            if len(warnings) > 100:
+                                del warnings[:-100]
+            except (OSError, ValueError):
+                pass
+
+        try:
+            with os.scandir(folder) as entries:
+                for index, entry in enumerate(entries, start=1):
+                    if self.batch_cancel_event.is_set():
+                        cancelled = True
+                        break
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext in SUPPORTED_EXTENSIONS:
+                                files.append(entry.path)
+                    except OSError:
+                        continue
+                    if index % 200 == 0:
+                        self.root.after(0, self.update_batch_discovery, len(files), False)
+
+            if not cancelled:
+                self.root.after(0, self.update_batch_discovery, len(files), True)
+            files.sort(key=lambda path: os.path.basename(path).lower())
+            total = len(files)
+
+            if total == 0 or cancelled:
+                cancelled = True
+            else:
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                command = [
+                    *EXIFTOOL_CMD,
+                    "-stay_open", "True", "-@", "-",
+                    "-common_args", "-charset", "filename=utf8",
+                    "-fast2", "-q", "-q", "-m"
+                ]
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=creationflags,
+                    env=EXIFTOOL_ENV,
+                    cwd=EXIFTOOL_CWD,
+                )
+                with self.batch_process_lock:
+                    self.batch_process = process
+
+                if process.stderr:
+                    stderr_thread = threading.Thread(
+                        target=drain_stderr, args=(process.stderr,), daemon=True
+                    )
+                    stderr_thread.start()
+
+                chunk_size = BATCH_CHUNK_SIZE
+                ready_marker = "{ready}"
+
+                for start_idx in range(0, total, chunk_size):
+                    if self.batch_cancel_event.is_set():
+                        cancelled = True
+                        break
+                    chunk = files[start_idx:start_idx + chunk_size]
+
+                    request_lines = ["-json\n"]
+                    for tag in (
+                        "-ShutterCount", "-Track4:ShutterCount", "-Canon:ShutterCount",
+                        "-Nikon:ShutterCount", "-Sony:ShutterCount", "-Fuji:ShutterCount",
+                        "-Model", "-DateTimeOriginal", "-FileName", "-Directory"
+                    ):
+                        request_lines.append(f"{tag}\n")
+                    for file_path in chunk:
+                        request_lines.append(f"{file_path}\n")
+                    request_lines.append("-execute\n")
+
+                    try:
+                        process.stdin.write("".join(request_lines))
+                        process.stdin.flush()
+                    except (BrokenPipeError, OSError) as write_err:
+                        raise RuntimeError(f"Сбой отправки блока в ExifTool: {write_err}")
+
+                    output_lines = []
+                    while True:
+                        line = process.stdout.readline()
+                        if line == "":
+                            if self.batch_cancel_event.is_set():
+                                cancelled = True
+                                break
+                            raise RuntimeError("ExifTool завершился до окончания блока.")
+                        if line.strip() == ready_marker:
+                            break
+                        output_lines.append(line)
+
+                    if cancelled or self.batch_cancel_event.is_set():
+                        cancelled = True
+                        break
+
+                    output_text = "".join(output_lines).strip()
+                    records = json.loads(output_text) if output_text else []
+                    normalised_chunk = [
+                        self.normalise_record(record, record.get("SourceFile", ""))
+                        for record in records
+                    ]
+                    results.extend(normalised_chunk)
+                    attempted += len(chunk)
+
+                    elapsed = max(time.monotonic() - started, 0.001)
+                    speed = attempted / elapsed
+                    remaining = (total - attempted) / speed if speed > 0 else None
+                    self.root.after(
+                        0, self.update_batch_progress,
+                        attempted, total, speed, remaining,
+                        os.path.basename(chunk[-1])
+                    )
+
+            cancelled = cancelled or self.batch_cancel_event.is_set()
+
+        except Exception as exc:
+            error_message = str(exc)
+
+        finally:
+            if process is not None:
+                try:
+                    if process.poll() is None and not cancelled and not error_message:
+                        if process.stdin and not process.stdin.closed:
+                            process.stdin.write("-stay_open\nFalse\n")
+                            process.stdin.flush()
+                            process.stdin.close()
+                        process.wait(timeout=15)
+                    elif process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=3)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                with self.batch_process_lock:
+                    self.batch_process = None
+
+            read_seconds = max(time.monotonic() - started, 0.001)
+            metadata = {
+                "folder": folder,
+                "files_found": len(files),
+                "files_attempted": attempted,
+                "read_seconds": read_seconds,
+                "average_files_per_second": (attempted / read_seconds) if read_seconds > 0 else 0,
+                "cancelled": cancelled,
+                "analysis_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "exiftool_version": self.get_exiftool_version(),
+            }
+            self.root.after(0, self.finish_batch, results, metadata, cancelled, error_message)
+
+    def update_batch_discovery(self, count: int, finished: bool) -> None:
+        if finished:
+            self.batch_progress_label.config(text=f"Найдено поддерживаемых файлов: {count:,}".replace(",", " "))
+        else:
+            self.batch_progress_label.config(text=f"Поиск файлов… найдено: {count:,}".replace(",", " "))
+
+    def update_batch_progress(self, current: int, total: int, speed: float, remaining: float | None, current_file: str) -> None:
+        self.set_progress(current, total)
+        rem_str = f"~{int(remaining)} с" if remaining is not None and remaining >= 0 else "—"
+        cur_file_short = self.compact_text(current_file, 28)
+        self.batch_progress_label.config(
+            text=f"Обработано {current:,} из {total:,}  ·  Скорость: {speed:.1f} ф/с  ·  Осталось: {rem_str}  ·  {cur_file_short}".replace(",", " ")
+        )
+
+    def finish_batch(self, results: list[dict], metadata: dict, cancelled: bool, error_message: str | None) -> None:
+        self.set_busy(False)
+        self.batch_results = results
+        self.batch_metadata = metadata
+        self.batch_cancelled = cancelled
+
+        if error_message:
+            self.show_error(error_message)
+            self.batch_summary.config(text="Анализ прерван из-за ошибки.")
+            return
+
+        total_files = metadata.get("files_attempted", len(results))
+        read_seconds = metadata.get("read_seconds", 0)
+        readable_count = sum(1 for item in results if item.get("ShutterCount") is not None)
+        missing_count = len(results) - readable_count
+
+        if cancelled:
+            summary_text = (
+                f"Анализ прерван пользователем. Проверено: {total_files} файлов за {read_seconds:.1f} с. "
+                f"Счётчик найден у {readable_count}, не найден у {missing_count}."
+            )
+        else:
+            summary_text = (
+                f"Готово. Проверено: {total_files:,} файлов за {read_seconds:.1f} с. "
+                f"Счётчик найден: {readable_count:,}, не найден: {missing_count:,}."
+            ).replace(",", " ")
+
+        self.batch_summary.config(text=summary_text)
+        self.batch_progress_label.config(text="Отображение результатов в таблице…")
+        self.csv_button.config(state="normal" if results else "disabled")
+        self.start_table_render()
+
+    def start_table_render(self) -> None:
+        for item in self.batch_table.get_children():
+            self.batch_table.delete(item)
+        self.render_index = 0
+        self.render_chunk()
+
+    def render_chunk(self) -> None:
+        results = self.batch_results
+        total = len(results)
+        end = min(self.render_index + TABLE_CHUNK_SIZE, total)
+
+        for i in range(self.render_index, end):
+            data = results[i]
+            shutter = data.get("ShutterCount")
+            shutter_text = f"{int(shutter):,}".replace(",", " ") if shutter is not None else "Не найден"
+            date_text = format_display_date(data.get("DateTimeOriginal"))
+            obs = data.get("ProcessingError") or ("Счётчик найден" if shutter is not None else "Тег не записан")
+            self.batch_table.insert(
+                "", "end",
+                values=(
+                    data.get("FileName") or "",
+                    shutter_text,
+                    date_text,
+                    data.get("Model") or "—",
+                    obs,
+                    data.get("SourceFile") or "",
+                ),
+            )
+        self.render_index = end
+        if self.render_index < total:
+            self.root.after(10, self.render_chunk)
+        else:
+            readable = sum(1 for x in results if x.get("ShutterCount") is not None)
+            missing = total - readable
+            self.batch_progress_label.config(
+                text=f"Таблица заполнена. Всего записей: {total:,} (со счётчиком: {readable:,}, без: {missing:,}).".replace(",", " ")
+            )
+
+    def cancel_batch(self) -> None:
+        if not self.busy or self.current_mode != "batch":
+            return
+        self.batch_cancel_event.set()
+        self.cancel_button.config(state="disabled", text="Останавливаем…")
+        with self.batch_process_lock:
+            if self.batch_process and self.batch_process.poll() is None:
+                try:
+                    self.batch_process.terminate()
+                except OSError:
+                    pass
+
+    def sort_batch_table(self, col: str, reverse: bool) -> None:
+        children = list(self.batch_table.get_children(""))
+        if not children:
+            return
+
+        def sort_key(item_id):
+            val = self.batch_table.set(item_id, col)
+            if col == "shutter":
+                clean = re.sub(r"[^\d]", "", val)
+                return (0, int(clean)) if clean else (1, -1)
+            return (0, val.lower())
+
+        children.sort(key=sort_key, reverse=reverse)
+        for index, item_id in enumerate(children):
+            self.batch_table.move(item_id, "", index)
+        self.batch_table.heading(
+            col, command=lambda: self.sort_batch_table(col, not reverse)
+        )
+
+    @staticmethod
+    def get_exiftool_version() -> str:
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            result = subprocess.run(
+                [*EXIFTOOL_CMD, "-ver"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", creationflags=creationflags,
+                env=EXIFTOOL_ENV, cwd=EXIFTOOL_CWD,
+            )
+            return result.stdout.strip() if result.returncode == 0 else "Не удалось определить"
+        except OSError:
+            return "Не удалось определить"
+
+    def export_csv(self) -> None:
+        if self.busy:
+            return
+        if not self.batch_results:
+            messagebox.showwarning("OpenEOS", "Сначала выполните пакетный анализ.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Сохранить результаты", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.writer(file)
+                writer.writerow(["OpenEOS_version", APP_VERSION])
+                writer.writerow(["ExifTool_version", self.batch_metadata.get("exiftool_version", "")])
+                writer.writerow(["Analysis_time", self.batch_metadata.get("analysis_time", "")])
+                writer.writerow(["Files_found", self.batch_metadata.get("files_found", "")])
+                writer.writerow(["Files_attempted", self.batch_metadata.get("files_attempted", "")])
+                writer.writerow(["Read_time_seconds", round(self.batch_metadata.get("read_seconds", 0), 2)])
+                writer.writerow(["Average_files_per_second", round(self.batch_metadata.get("average_files_per_second", 0), 2)])
+                writer.writerow(["Cancelled_by_user", bool(self.batch_metadata.get("cancelled", False))])
+                writer.writerow([])
+                writer.writerow([
+                    "filename", "shutter_count", "counter_tag", "date_time_original",
+                    "model", "directory", "full_path", "processing_error", "source"
+                ])
+                for data in self.batch_results:
+                    writer.writerow([
+                        data.get("FileName", ""), data.get("ShutterCount", ""),
+                        data.get("CounterTag", ""), data.get("DateTimeOriginal", ""),
+                        data.get("Model", ""), data.get("Directory", ""),
+                        data.get("SourceFile", ""), data.get("ProcessingError", ""),
+                        "ExifTool"
+                    ])
+            messagebox.showinfo("OpenEOS", "CSV сохранён.")
+        except Exception as exc:
+            self.show_error(str(exc))
+
+    def set_busy(self, busy: bool, mode: str | None = None) -> None:
+        self.busy = busy
+        self.current_mode = mode if busy else None
+        state = "disabled" if busy else "normal"
+        self.single_select_button.config(state=state)
+        self.batch_select_button.config(state=state)
+        self.batch_analyze_button.config(state=state)
+        self.csv_button.config(state="disabled" if busy or not self.batch_results else "normal")
+        if busy and mode == "batch":
+            self.cancel_button.config(state="normal", text="Прервать анализ")
+        else:
+            self.cancel_button.config(state="disabled", text="Прервать анализ")
+
+    def show_error(self, error: str) -> None:
+        messagebox.showerror(f"{APP_TITLE} — ошибка", error)
+
+
+if __name__ == "__main__":
+    root = ROOT_CLASS()
+    try:
+        root.withdraw()
+    except Exception:
+        pass
+    theme = detect_system_theme()
+    bg = THEMES[theme]["BG"]
+    root.configure(bg=bg)
+    apply_titlebar_theme(root, theme == "dark")
+    app = OpenEOSServiceApp(root)
+    root.mainloop()

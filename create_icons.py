@@ -1,7 +1,9 @@
 """
 Генератор профессиональной иконки камеры для OpenEOS (PNG и мульти-размерный ICO).
 Работает на чистом стандартном Python без внешних зависимостей (zlib + struct).
-Создает app_icon.png и app_icon.ico (содержит 256x256, 64x64, 48x48, 32x32, 16x16).
+Создает:
+1. app_icon.png / app_icon.ico (классический синий акцент для OpenEOS)
+2. app_icon_service.png / app_icon_service.ico (изумрудный зеленый сервисный акцент для OpenEOS Service)
 """
 from __future__ import annotations
 
@@ -62,15 +64,14 @@ def write_ico(png_dict: dict[int, bytes]) -> bytes:
     return bytes(header + entries + image_data)
 
 
-def render_camera_icon(size: int = 256) -> bytes:
+def render_camera_icon(size: int = 256, color_scheme: str = "blue") -> bytes:
     """Рендерит высококачественную иконку камеры с субпиксельным сглаживанием (SSAA)."""
-    # Буфер RGBA
     pixels = bytearray(size * size * 4)
 
     scale = size / 256.0
     cx, cy = size / 2.0, size / 2.0 + 4 * scale
 
-    # Параметры корпуса камеры (в масштабе 256)
+    # Параметры корпуса камеры
     body_l, body_r = 28 * scale, 228 * scale
     body_t, body_b = 76 * scale, 218 * scale
     body_radius = 26 * scale
@@ -91,17 +92,17 @@ def render_camera_icon(size: int = 256) -> bytes:
     r_inner = 38 * scale
     r_glass = 26 * scale
 
-    # Красная точка / pro badge
+    # Маркер Pro / бейдж
     red_cx, red_cy = 196 * scale, 104 * scale
     red_r = 6.5 * scale
 
-    # Подвыборка 2x2 для сглаживания
     samples = [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)]
+
+    is_green = (color_scheme == "green")
 
     def point_in_rrect(px, py, l, t, r, b, rad):
         if px < l or px > r or py < t or py > b:
             return False
-        # Углы
         if px < l + rad and py < t + rad:
             return (px - (l + rad)) ** 2 + (py - (t + rad)) ** 2 <= rad ** 2
         if px > r - rad and py < t + rad:
@@ -128,23 +129,27 @@ def render_camera_icon(size: int = 256) -> bytes:
                     a_acc += 255
                     continue
 
-                # 2. Проверка видоискателя
+                # 2. Проверка видоискателя и корпуса
                 in_prism = point_in_rrect(px, py, prism_l, prism_t, prism_r, prism_b, prism_radius)
                 in_body = point_in_rrect(px, py, body_l, body_t, body_r, body_b, body_radius)
 
                 if in_prism or in_body:
-                    # Корпус камеры: цвет титановый темно-серый с легким вертикальным градиентом
                     grad = (py - body_t) / max(1.0, body_b - body_t)
                     c_val = int(38 - grad * 12)
 
-                    # Объектив (поверх корпуса)
+                    # Объектив
                     dist_lens = math.hypot(px - lens_cx, py - lens_cy)
                     if dist_lens <= r_outer:
                         if dist_lens > r_mid:
-                            # Внешний металлический безель с синим акцентом
-                            r_acc += 0
-                            g_acc += 103
-                            b_acc += 192
+                            # Внешний металлический безель (Синий vs Изумрудный Зеленый)
+                            if is_green:
+                                r_acc += 16
+                                g_acc += 185
+                                b_acc += 90
+                            else:
+                                r_acc += 0
+                                g_acc += 103
+                                b_acc += 192
                             a_acc += 255
                         elif dist_lens > r_inner:
                             # Металлическое кольцо оправы
@@ -159,18 +164,27 @@ def render_camera_icon(size: int = 256) -> bytes:
                             b_acc += 32
                             a_acc += 255
                         else:
-                            # Глубокое оптическое стекло с диагональным бликом
-                            # Блик в верхнем левом углу
+                            # Стекло с бликом
                             refl_dist = math.hypot(px - (lens_cx - 8 * scale), py - (lens_cy - 8 * scale))
                             if refl_dist < 10 * scale:
-                                r_acc += 140
-                                g_acc += 215
-                                b_acc += 255
+                                if is_green:
+                                    r_acc += 160
+                                    g_acc += 240
+                                    b_acc += 200
+                                else:
+                                    r_acc += 140
+                                    g_acc += 215
+                                    b_acc += 255
                                 a_acc += 255
                             elif refl_dist < 18 * scale and (px < lens_cx and py < lens_cy):
-                                r_acc += 30
-                                g_acc += 120
-                                b_acc += 190
+                                if is_green:
+                                    r_acc += 20
+                                    g_acc += 150
+                                    b_acc += 100
+                                else:
+                                    r_acc += 30
+                                    g_acc += 120
+                                    b_acc += 190
                                 a_acc += 255
                             else:
                                 r_acc += 12
@@ -179,12 +193,17 @@ def render_camera_icon(size: int = 256) -> bytes:
                                 a_acc += 255
                         continue
 
-                    # Красный Pro-маркер (Canon style)
+                    # Маркер Pro / сервисная индикация
                     dist_red = math.hypot(px - red_cx, py - red_cy)
                     if dist_red <= red_r:
-                        r_acc += 225
-                        g_acc += 25
-                        b_acc += 35
+                        if is_green:
+                            r_acc += 34
+                            g_acc += 197
+                            b_acc += 94
+                        else:
+                            r_acc += 225
+                            g_acc += 25
+                            b_acc += 35
                         a_acc += 255
                         continue
 
@@ -193,9 +212,6 @@ def render_camera_icon(size: int = 256) -> bytes:
                     g_acc += c_val + 2
                     b_acc += c_val + 6
                     a_acc += 255
-                else:
-                    # Прозрачный фон
-                    pass
 
             idx = (y * size + x) * 4
             pixels[idx] = r_acc // 4
@@ -206,31 +222,41 @@ def render_camera_icon(size: int = 256) -> bytes:
     return bytes(pixels)
 
 
-def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    png_path = os.path.join(base_dir, "app_icon.png")
-    ico_path = os.path.join(base_dir, "app_icon.ico")
+def generate_all_icons(base_dir: str | None = None) -> None:
+    if not base_dir:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    print("Генерация иконки камеры для OpenEOS...")
     resolutions = [256, 64, 48, 32, 16]
-    png_dict = {}
 
+    # 1. Синяя классическая иконка (OpenEOS)
+    png_dict_blue = {}
     for res in resolutions:
-        print(f"  - Рендеринг слоя {res}x{res}...")
-        raw_rgba = render_camera_icon(res)
+        raw_rgba = render_camera_icon(res, color_scheme="blue")
         png_data = write_png(res, res, raw_rgba)
-        png_dict[res] = png_data
+        png_dict_blue[res] = png_data
         if res == 256:
-            with open(png_path, "wb") as f:
+            with open(os.path.join(base_dir, "app_icon.png"), "wb") as f:
                 f.write(png_data)
-            print(f"  -> Сохранен {png_path}")
 
-    ico_data = write_ico(png_dict)
-    with open(ico_path, "wb") as f:
-        f.write(ico_data)
-    print(f"  -> Сохранен {ico_path} (содержит 5 разрешений: 256, 64, 48, 32, 16)")
-    print("Готово! Иконка успешно создана.")
+    ico_blue = write_ico(png_dict_blue)
+    with open(os.path.join(base_dir, "app_icon.ico"), "wb") as f:
+        f.write(ico_blue)
+
+    # 2. Изумрудно-зеленая сервисная иконка (OpenEOS Service)
+    png_dict_green = {}
+    for res in resolutions:
+        raw_rgba = render_camera_icon(res, color_scheme="green")
+        png_data = write_png(res, res, raw_rgba)
+        png_dict_green[res] = png_data
+        if res == 256:
+            with open(os.path.join(base_dir, "app_icon_service.png"), "wb") as f:
+                f.write(png_data)
+
+    ico_green = write_ico(png_dict_green)
+    with open(os.path.join(base_dir, "app_icon_service.ico"), "wb") as f:
+        f.write(ico_green)
 
 
 if __name__ == "__main__":
-    main()
+    generate_all_icons()
+    print("Иконки успешно сгенерированы: синяя (app_icon.ico) и сервисная зеленая (app_icon_service.ico).")

@@ -1,0 +1,750 @@
+"""
+OpenEOS Service: Core Canon USB Hardware Engine.
+Direct Live Hardware Communication via Official Canon EDSDK & Win32 SetupAPI.
+Zero mock data. Zero disk/dump reading. 100% online hardware polling on every click.
+"""
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
+import json
+import os
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import time
+
+def dbg_log(msg: str):
+    try:
+        log_path = Path(__file__).parent / "sti_debug.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+# Диагностика экспортов EDSDK.dll
+try:
+    _d = Path(__file__).parent / "EDSDK.dll"
+    if _d.exists():
+        import dump_exports
+        _exps = dump_exports.dump_pe_exports(_d)
+        _interesting = [e for e in _exps if any(k in e.lower() for k in ["command", "ptp", "prop", "vendor", "custom", "send", "get"])]
+        Path(__file__).parent.joinpath("edsdk_commands.txt").write_text("\n".join(_interesting), encoding="utf-8")
+except Exception:
+    pass
+
+try:
+    import fetch_src
+except Exception as _ex:
+    dbg_log(f"fetch_src error: {_ex}")
+
+def read_shutter_from_header(file_path: str) -> int | None:
+    if not file_path or not os.path.isfile(file_path):
+        return None
+    try:
+        exiftool_exe = r"C:\Tools\ExifTool\exiftool.exe"
+        if not os.path.isfile(exiftool_exe):
+            exiftool_exe = "exiftool"
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        res = subprocess.run(
+            [exiftool_exe, "-Track4:ShutterCount", "-Canon:ShutterCount", "-ShutterCount", "-s3", "-fast2", file_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+            timeout=3
+        )
+        out = res.stdout.strip()
+        import re
+        m = re.search(r"(\d+)", out)
+        if m:
+            val = int(m.group(1))
+            dbg_log(f"Extracted ShutterCount from downloaded camera header: {val}")
+            return val
+    except Exception as ex:
+        dbg_log(f"ExifTool header parse error: {ex}")
+    return None
+
+CANON_MODELS = {
+    "330B": {"name": "Canon EOS R6 Mark II", "short": "R6m2", "rating": 500_000},
+    "32F8": {"name": "Canon EOS R10", "short": "R10", "rating": 100_000},
+    "32D7": {"name": "Canon EOS R5", "short": "R5", "rating": 500_000},
+    "3327": {"name": "Canon EOS R5 Mark II", "short": "R5m2", "rating": 500_000},
+    "32D8": {"name": "Canon EOS R6", "short": "R6", "rating": 300_000},
+    "32E4": {"name": "Canon EOS R3", "short": "R3", "rating": 500_000},
+    "32F7": {"name": "Canon EOS R7", "short": "R7", "rating": 200_000},
+    "3312": {"name": "Canon EOS R8", "short": "R8", "rating": 100_000},
+    "3313": {"name": "Canon EOS R50", "short": "R50", "rating": 100_000},
+    "3314": {"name": "Canon EOS R100", "short": "R100", "rating": 100_000},
+    "3273": {"name": "Canon EOS 5D Mark IV", "short": "5D4", "rating": 150_000},
+    "3218": {"name": "Canon EOS 5D Mark III", "short": "5D3", "rating": 150_000},
+    "3280": {"name": "Canon EOS 1D X Mark II", "short": "1DX2", "rating": 400_000},
+    "32E2": {"name": "Canon EOS 1D X Mark III", "short": "1DX3", "rating": 500_000},
+    "3326": {"name": "Canon EOS R1", "short": "R1", "rating": 500_000},
+    "32B7": {"name": "Canon EOS RP", "short": "RP", "rating": 100_000},
+    "32B8": {"name": "Canon EOS R", "short": "EOS R", "rating": 200_000},
+    "329B": {"name": "Canon EOS 6D Mark II", "short": "6D2", "rating": 100_000},
+    "3238": {"name": "Canon EOS 6D", "short": "6D", "rating": 100_000},
+    "3258": {"name": "Canon EOS 7D Mark II", "short": "7D2", "rating": 200_000},
+    "3283": {"name": "Canon EOS 80D", "short": "80D", "rating": 100_000},
+    "32EB": {"name": "Canon EOS 90D", "short": "90D", "rating": 120_000},
+}
+
+
+class CanonCameraDevice:
+    def __init__(self, dev_id: str, name: str, pid: str = "", serial: str = ""):
+        self.dev_id = dev_id
+        self.raw_name = name
+        self.pid = pid.upper()
+        self.serial = serial
+
+        matched_meta = None
+        for known_pid, meta in CANON_MODELS.items():
+            if known_pid in dev_id.upper() or meta["short"].lower() in name.lower() or meta["name"].lower() in name.lower():
+                matched_meta = meta
+                self.pid = known_pid
+                break
+
+        if matched_meta:
+            self.display_name = matched_meta["name"]
+            self.short_tag = matched_meta["short"]
+            self.rating = matched_meta["rating"]
+        else:
+            self.display_name = name or "Canon EOS Camera"
+            self.short_tag = "EOS"
+            self.rating = 300_000
+
+
+# ===========================================================================
+# SetupAPI Physical Bus Scanner
+# ===========================================================================
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", wintypes.BYTE * 8),
+    ]
+
+
+class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("ClassGuid", GUID),
+        ("DevInst", wintypes.DWORD),
+        ("Reserved", ctypes.c_size_t),
+    ]
+
+
+def scan_cameras_via_setupapi(retries: int = 1, delay: float = 0.2) -> list[CanonCameraDevice]:
+    setupapi = ctypes.windll.setupapi
+
+    setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD]
+
+    setupapi.SetupDiEnumDeviceInfo.restype = wintypes.BOOL
+    setupapi.SetupDiEnumDeviceInfo.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(SP_DEVINFO_DATA)]
+
+    setupapi.SetupDiGetDeviceRegistryPropertyW.restype = wintypes.BOOL
+    setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(SP_DEVINFO_DATA), wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+
+    setupapi.SetupDiGetDeviceInstanceIdW.restype = wintypes.BOOL
+    setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(SP_DEVINFO_DATA), wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+
+    setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+    DIGCF_PRESENT = 0x00000002
+    DIGCF_ALLCLASSES = 0x00000004
+    SPDRP_HARDWAREID = 0x00000001
+    SPDRP_FRIENDLYNAME = 0x0000000C
+    SPDRP_DEVICEDESC = 0x00000000
+    SPDRP_MFG = 0x0000000B
+
+    for attempt in range(max(1, retries)):
+        h_info = setupapi.SetupDiGetClassDevsW(None, None, None, DIGCF_PRESENT | DIGCF_ALLCLASSES)
+        if not h_info or h_info == ctypes.c_void_p(-1).value:
+            if attempt < retries - 1:
+                time.sleep(delay)
+            continue
+
+        found = []
+        seen_pids = set()
+        idx = 0
+        dev_info = SP_DEVINFO_DATA()
+        dev_info.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+
+        def query_prop(prop_id):
+            buf = ctypes.create_unicode_buffer(512)
+            req = wintypes.DWORD(0)
+            ok = setupapi.SetupDiGetDeviceRegistryPropertyW(
+                h_info, ctypes.byref(dev_info), prop_id, None, ctypes.byref(buf), 1024, ctypes.byref(req)
+            )
+            return buf.value if ok else ""
+
+        while setupapi.SetupDiEnumDeviceInfo(h_info, idx, ctypes.byref(dev_info)):
+            hw_id = query_prop(SPDRP_HARDWAREID)
+            friendly = query_prop(SPDRP_FRIENDLYNAME)
+            desc = query_prop(SPDRP_DEVICEDESC)
+            mfg = query_prop(SPDRP_MFG)
+
+            if "04A9" in hw_id.upper() or "CANON" in (friendly + desc + mfg).upper():
+                if "&MI_01" not in hw_id.upper():
+                    inst_buf = ctypes.create_unicode_buffer(512)
+                    req_inst = wintypes.DWORD(0)
+                    ok_inst = False
+                    try:
+                        ok_inst = setupapi.SetupDiGetDeviceInstanceIdW(
+                            h_info, ctypes.byref(dev_info), inst_buf, 512, ctypes.byref(req_inst)
+                        )
+                    except Exception:
+                        pass
+                    inst_id = inst_buf.value if ok_inst else ""
+                    serial = ""
+                    if "\\" in inst_id:
+                        parts = inst_id.split("\\")
+                        if len(parts) >= 3 and not parts[-1].startswith("{"):
+                            serial = parts[-1]
+
+                    pid = ""
+                    for part in hw_id.upper().split("&"):
+                        if part.startswith("PID_"):
+                            pid = part.replace("PID_", "")
+                            break
+
+                    name = friendly or desc or "Canon Camera"
+                    if pid and pid not in seen_pids:
+                        seen_pids.add(pid)
+                        found.append(CanonCameraDevice(hw_id, name, pid, serial))
+            idx += 1
+
+        setupapi.SetupDiDestroyDeviceInfoList(h_info)
+        if found:
+            return found
+        if attempt < retries - 1:
+            time.sleep(delay)
+
+    return []
+
+
+# ===========================================================================
+# Canon PTP Manager (Public API)
+# ===========================================================================
+class CanonPTPManager:
+    def __init__(self):
+        self.connected = False
+        self.active_camera: CanonCameraDevice | None = None
+        self.session_data: dict | None = None
+
+    def enumerate_cameras(self, retries: int = 1, delay: float = 0.2) -> list[CanonCameraDevice]:
+        dbg_log("enumerate_cameras() called")
+        setup_devices = scan_cameras_via_setupapi(retries=retries, delay=delay)
+        dbg_log(f"Found cameras via SetupAPI: {len(setup_devices)}")
+        return setup_devices
+
+    def connect(self, device: CanonCameraDevice | None = None) -> dict:
+        dbg_log("connect() started")
+        active_devices = self.enumerate_cameras(retries=3, delay=0.2)
+        if not active_devices:
+            dbg_log("No active cameras found on USB")
+            raise RuntimeError(
+                "Камера Canon не обнаружена на шине USB.\n\n"
+                "1. Убедитесь, что камера включена (тумблер питания в положении ON).\n"
+                "2. Проверьте подключение USB-кабеля к ПК и камере.\n"
+                "3. Убедитесь, что закрыты сторонние утилиты (EOS Utility и т.п.)."
+            )
+
+        if not device:
+            device = active_devices[0]
+
+        self.active_camera = device
+        dbg_log(f"Selected active camera: {device.display_name} (PID {device.pid})")
+
+        model = device.display_name
+        rating = device.rating
+        serial = getattr(device, "serial", "") or "—"
+        firmware = "—"
+        battery_pct = None
+        shutter_mecha = None
+        release_total = None
+        temp_sensor = None
+        temp_pcb = None
+        power_on = None
+        uptime = None
+        errors = []
+
+        # 1. Запуск официального Canon EDSDK воркера (canon_live_usb.exe)
+        worker_exe = Path(__file__).parent / "canon_live_usb.exe"
+        if worker_exe.exists():
+            try:
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                proc = subprocess.run(
+                    [str(worker_exe)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=creationflags,
+                    timeout=8
+                )
+                stdout_str = proc.stdout.strip()
+                dbg_log(f"worker_exe stdout: {stdout_str}")
+                if stdout_str:
+                    w_data = json.loads(stdout_str)
+                    if w_data.get("success", False):
+                        model = w_data.get("model") or model
+                        serial = w_data.get("serial") or serial
+                        firmware = w_data.get("firmware") or firmware
+                        rating = w_data.get("rating") or rating
+                        battery_pct = w_data.get("battery_percent")
+                        shutter_mecha = w_data.get("shutter_mechanical")
+
+                        # Если скачан заголовок последнего кадра с SD-карты камеры по USB
+                        latest_header = w_data.get("latest_header_path")
+                        if latest_header:
+                            val = read_shutter_from_header(latest_header)
+                            if val is not None and val > 0:
+                                shutter_mecha = val
+                                release_total = val
+                                dbg_log(f"Live Shutter Count extracted from camera SD card over USB: {val}")
+
+                        dbg_log(f"EDSDK Worker success: model={model}, serial={serial}, fw={firmware}, shutter={shutter_mecha}, bat={battery_pct}%")
+                    elif "error" in w_data:
+                        raise RuntimeError(w_data["error"])
+            except RuntimeError:
+                raise
+            except Exception as exW:
+                dbg_log(f"worker_exe error: {exW}")
+
+        # Вывод подтверждённых данных живого подключения в консоль / терминал
+        print("\n" + "=" * 60)
+        print(f"[OpenEOS Live] Подключена камера: {model}")
+        print(f"  Серийный номер: {serial}")
+        print(f"  Прошивка:       {firmware}")
+        bat_str = f"{battery_pct}%" if battery_pct is not None else "—"
+        print(f"  Заряд батареи:  {bat_str}")
+        print("=" * 60 + "\n", flush=True)
+
+        # Формирование данных сессии (строго живые аппаратные данные)
+        wear_pct = round((shutter_mecha / rating) * 100, 1) if (shutter_mecha is not None and rating > 0) else None
+        elec_shots = None
+        elec_pct = None
+        if release_total is not None and shutter_mecha is not None and release_total >= shutter_mecha:
+            elec_shots = max(0, release_total - shutter_mecha)
+            elec_pct = round((elec_shots / release_total) * 100, 1) if release_total > 0 else 0.0
+
+        self.session_data = {
+            "model": model,
+            "raw_name": device.raw_name,
+            "pid": device.pid,
+            "dev_id": device.dev_id,
+            "rating": rating,
+            "serial": serial,
+            "firmware": firmware,
+            "sensor_sn": "—",
+            "shutter_mechanical": shutter_mecha,
+            "release_total": release_total,
+            "electronic_shots": elec_shots,
+            "electronic_pct": elec_pct,
+            "wear_percent": wear_pct,
+            "battery_percent": battery_pct,
+            "temp_imager": temp_sensor,
+            "temp_pcb": temp_pcb,
+            "temp_shutter": None,
+            "temp_tft": None,
+            "power_on_count": power_on,
+            "running_time": uptime,
+            "errors": errors,
+        }
+
+        self.connected = True
+        dbg_log(f"connect() finished successfully. Serial={serial}, Model={model}, Shutter={shutter_mecha}, Battery={battery_pct}%")
+        return self.session_data
+
+    def read_live_ptp_properties(self) -> dict:
+        """
+        Executes live comparative PTP interrogation across all 3 transports:
+        1. STI Raw USB Transport (Tornado EOS mechanism: sti.dll -> usbscan.sys)
+        2. Windows Portable Devices (WPD MTP Extension Pass-Through)
+        3. PTP-IP Network Transport (RFC/CIPA 15740 over TCP port 15740)
+        """
+        import datetime
+        from openeos_ptp.reader import PropertyDiagnosticRecord, LiveCameraReadResult
+        try:
+            import openeos_ptpip
+        except Exception:
+            openeos_ptpip = None
+
+        target_pid = None
+        if self.active_camera and self.active_camera.pid:
+            try:
+                target_pid = int(self.active_camera.pid, 16)
+            except Exception:
+                pass
+
+        cam_name = self.active_camera.display_name if self.active_camera else "Canon EOS Camera"
+        pid_str = f"0x{target_pid:04X}" if target_pid else "auto-detect"
+
+        worker_exe = Path(__file__).resolve().parent / "canon_live_usb.exe"
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        t_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        diagnostics = []
+
+        read_json = {}
+        err_msg = ""
+
+        # 1. Запуск USB-воркера со сравнительным тестированием STI и WPD
+        if worker_exe.exists():
+            try:
+                proc_read = subprocess.run(
+                    [str(worker_exe), "--ptp-read"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=creationflags,
+                    timeout=20,
+                )
+                read_out = proc_read.stdout.strip()
+                dbg_log(f"--ptp-read output: {read_out}")
+                if read_out:
+                    brace_start = read_out.find("{")
+                    brace_end = read_out.rfind("}")
+                    raw_to_parse = read_out[brace_start:brace_end+1] if (brace_start != -1 and brace_end != -1 and brace_end > brace_start) else read_out
+                    import re
+                    # Remove all trailing commas iteratively (supports arbitrary nesting)
+                    clean_json = raw_to_parse
+                    prev = None
+                    while clean_json != prev:
+                        prev = clean_json
+                        clean_json = re.sub(r",+\s*([\]\}])", r"\1", clean_json)
+                    try:
+                        read_json = json.loads(clean_json)
+                    except Exception as exJson:
+                        dbg_log(f"json.loads failed: {exJson}, attempting regex extraction fallback")
+                        m1 = re.search(r'"(?:counter_0x12000001|shutter_mechanical)":\s*(\d+)', clean_json)
+                        m3 = re.search(r'"(?:counter_0x12000003|release_total)":\s*(\d+)', clean_json)
+                        mp = re.search(r'"power_on_count":\s*(\d+)', clean_json)
+                        mu = re.search(r'"uptime_seconds":\s*(\d+)', clean_json)
+                        read_json = {
+                            "success": bool(m1 or m3),
+                            "counter_0x12000001": int(m1.group(1)) if m1 else None,
+                            "counter_0x12000003": int(m3.group(1)) if m3 else None,
+                            "power_on_count": int(mp.group(1)) if mp else None,
+                            "uptime_seconds": int(mu.group(1)) if mu else None,
+                            "transports": {"wpd": {"success": bool(m1 or m3)}}
+                        }
+            except Exception as exRead:
+                dbg_log(f"--ptp-read invocation failed: {exRead}")
+                err_msg = str(exRead)
+        else:
+            err_msg = f"Файл {worker_exe.name} не найден. Скомпилируйте его через run_service.bat."
+
+        # 2. Сетевой PTP-IP зонд отключён (приоритет - прямой USB WPD MTP)
+        ptpip_info = {
+            "name": "PTP-IP Network Transport (TCP:15740)",
+            "status": "OFFLINE",
+            "elapsed_ms": 0,
+            "message": "Отключено (прямой USB WPD MTP транспорт)"
+        }
+
+        transports_dict = read_json.get("transports", {})
+        sti_info = transports_dict.get("sti", {})
+        wpd_info = transports_dict.get("wpd", {})
+
+        # Извлечение счётчиков из лучшего рабочего транспорта
+        c1 = read_json.get("counter_0x12000001")
+        c1_raw = read_json.get("raw_0x12000001_hex")
+        c3 = read_json.get("counter_0x12000003")
+        c3_raw = read_json.get("raw_0x12000003_hex")
+        pwr_count = read_json.get("power_on_count")
+        uptime_sec = read_json.get("uptime_seconds")
+
+        if c1 is None:
+            if sti_info.get("shutter_mechanical") is not None and sti_info["shutter_mechanical"] >= 0:
+                c1 = sti_info["shutter_mechanical"]
+                c1_raw = sti_info.get("raw_0x12000001")
+            elif wpd_info.get("shutter_mechanical") is not None and wpd_info["shutter_mechanical"] >= 0:
+                c1 = wpd_info["shutter_mechanical"]
+                c1_raw = wpd_info.get("raw_0x12000001")
+
+        if c3 is None:
+            if sti_info.get("release_total") is not None and sti_info["release_total"] >= 0:
+                c3 = sti_info["release_total"]
+                c3_raw = sti_info.get("raw_0x12000003")
+            elif wpd_info.get("release_total") is not None and wpd_info["release_total"] >= 0:
+                c3 = wpd_info["release_total"]
+                c3_raw = wpd_info.get("raw_0x12000003")
+
+        if pwr_count is None:
+            pwr_count = sti_info.get("power_on_count") or wpd_info.get("power_on_count")
+
+        if uptime_sec is None:
+            uptime_sec = sti_info.get("uptime_seconds") or wpd_info.get("uptime_seconds")
+
+        # 3. Обновление сессионных данных для графического интерфейса
+        if self.session_data:
+            if c1 is not None:
+                self.session_data["shutter_mechanical"] = c1
+                rating = self.session_data.get("rating", 100_000)
+                if rating > 0:
+                    self.session_data["wear_percent"] = round((c1 / rating) * 100, 1)
+            if c3 is not None:
+                self.session_data["release_total"] = c3
+            if c1 is not None and c3 is not None and c3 >= c1:
+                elec = c3 - c1
+                self.session_data["electronic_shots"] = elec
+                self.session_data["electronic_pct"] = round((elec / c3) * 100, 1) if c3 > 0 else 0.0
+            if pwr_count is not None:
+                self.session_data["power_on_count"] = pwr_count
+            if uptime_sec is not None:
+                d = uptime_sec // 86400
+                h = (uptime_sec % 86400) // 3600
+                m = (uptime_sec % 3600) // 60
+                s = uptime_sec % 60
+                self.session_data["running_time"] = f"{d}д {h:02d}ч {m:02d}м {s:02d}с"
+
+        overall_success = (c1 is not None or c3 is not None or read_json.get("success", False))
+        if not overall_success and not err_msg:
+            err_msg = read_json.get("message") or wpd_info.get("message") or sti_info.get("message") or "Сбой при чтении PTP-свойств камеры."
+        status_str = "SUCCESS" if overall_success else "ERROR"
+
+        # 4. Вывод результата в терминал
+        print("\n" + "=" * 76)
+        print(f"[OpenEOS Live] WPD MTP PTP-транспорт: {cam_name}")
+        print(f"PID камеры: {pid_str}")
+        print("-" * 76)
+        wpd_status = "SUCCESS" if (c1 is not None or c3 is not None or wpd_info.get("success")) else "ERROR"
+        wpd_sh = f"{c1:,}".replace(",", " ") if c1 is not None else "—"
+        wpd_rel = f"{c3:,}".replace(",", " ") if c3 is not None else "—"
+        wpd_pwr = f"{pwr_count:,}".replace(",", " ") if pwr_count is not None else "—"
+        wpd_up = f"{uptime_sec} с" if uptime_sec is not None else "—"
+        print("Windows Portable Devices (WPD MTP Extension Pass-Through):")
+        print(f"   - Статус:                 {wpd_status}")
+        print(f"   - Время выполнения:       {wpd_info.get('elapsed_ms', 0)} ms")
+        print(f"   - HRESULT:                {wpd_info.get('hresult', '0x00000000')}")
+        print(f"   - Response Code:          {wpd_info.get('response_code_hex', '0x2001 (OK)')}")
+        print(f"   - Механический затвор:    {wpd_sh}")
+        print(f"   - Всего спусков:          {wpd_rel}")
+        print(f"   - Число включений:        {wpd_pwr}")
+        print(f"   - Время наработки:        {wpd_up}")
+        if wpd_info.get("message"):
+            print(f"   - Сообщение:              {wpd_info.get('message')}")
+        print("=" * 76 + "\n", flush=True)
+
+        # Диагностические записи
+        best_name = read_json.get("best_transport", "STI / WPD")
+        best_tr = sti_info if best_name == "sti" else (wpd_info if best_name == "wpd" else (sti_info or wpd_info))
+
+        diag_01 = PropertyDiagnosticRecord(
+            source=f"Физическая камера ({best_name.upper()})",
+            request_time=t_now,
+            property_id="0x12000001",
+            property_name="Mechanical Shutter Count",
+            request_sent="FA_GetProperty(0x12000001)",
+            response_code_hex=best_tr.get("response_code_hex", "—"),
+            tx_id=25,
+            raw_bytes_hex=c1_raw or "[нет данных]",
+            decoded_value=c1,
+            status="SUCCESS" if c1 is not None else "ERROR",
+            error_message=None if c1 is not None else best_tr.get("message"),
+        )
+        diagnostics.append(diag_01)
+
+        diag_03 = PropertyDiagnosticRecord(
+            source=f"Физическая камера ({best_name.upper()})",
+            request_time=t_now,
+            property_id="0x12000003",
+            property_name="Total Release Count",
+            request_sent="FA_GetProperty(0x12000003)",
+            response_code_hex=best_tr.get("response_code_hex", "—"),
+            tx_id=31,
+            raw_bytes_hex=c3_raw or "[нет данных]",
+            decoded_value=c3,
+            status="SUCCESS" if c3 is not None else "ERROR",
+            error_message=None if c3 is not None else best_tr.get("message"),
+        )
+        diagnostics.append(diag_03)
+
+        live_result = LiveCameraReadResult(
+            source=f"Физическая камера ({best_name.upper()})",
+            timestamp=t_now,
+            counter_0x12000001=c1,
+            raw_0x12000001_hex=c1_raw,
+            counter_0x12000003=c3,
+            raw_0x12000003_hex=c3_raw,
+            status=status_str,
+            error_message=None if overall_success else err_msg,
+            diagnostics=diagnostics,
+        )
+
+        edsdk_sn = self.session_data.get("serial", "—") if self.session_data else "—"
+        edsdk_fw = self.session_data.get("firmware", "—") if self.session_data else "—"
+
+        self._write_diagnostic_log(
+            cam_name=cam_name,
+            serial=edsdk_sn,
+            fw=edsdk_fw,
+            pid_str=pid_str,
+            live_result=live_result,
+            sti_info=sti_info,
+            wpd_info=wpd_info,
+            ptpip_info=ptpip_info
+        )
+
+        return {
+            "result": live_result,
+            "counter_0x12000001": c1,
+            "raw_0x12000001_hex": c1_raw,
+            "counter_0x12000003": c3,
+            "raw_0x12000003_hex": c3_raw,
+            "power_on_count": pwr_count,
+            "uptime_seconds": uptime_sec,
+            "status": live_result.status,
+            "error_message": live_result.error_message,
+            "timestamp": live_result.timestamp,
+            "diagnostics": [d.to_dict() for d in live_result.diagnostics],
+            "transports": {
+                "sti": sti_info,
+                "wpd": wpd_info,
+                "ptpip": ptpip_info
+            }
+        }
+
+    def _write_diagnostic_log(
+        self,
+        cam_name: str,
+        serial: str,
+        fw: str,
+        pid_str: str,
+        live_result: Any,
+        sti_info: dict | None = None,
+        wpd_info: dict | None = None,
+        ptpip_info: dict | None = None,
+    ) -> None:
+        try:
+            log_path = Path(__file__).resolve().parent / "openeos_ptp_diagnostics.log"
+            timestamp = live_result.timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            lines = [
+                "=" * 76,
+                f"[{timestamp}] OpenEOS PTP Hardware Diagnostic Session",
+                f"Камера:               {cam_name}",
+                f"Серийный номер:       {serial}",
+                f"Версия прошивки:      {fw}",
+                f"USB PID:              {pid_str}",
+                "-" * 76,
+                "СРАВНИТЕЛЬНЫЙ АНАЛИЗ ТРАНСПОРТОВ:",
+            ]
+            if sti_info:
+                lines.append(f"  1. STI Raw USB Transport: status={sti_info.get('success')}, latency={sti_info.get('elapsed_ms', 0)} ms, hr={sti_info.get('hresult')}, shutter={sti_info.get('shutter_mechanical')}, releases={sti_info.get('release_total')}")
+            if wpd_info:
+                lines.append(f"  2. WPD MTP Transport:     status={wpd_info.get('success')}, latency={wpd_info.get('elapsed_ms', 0)} ms, hr={wpd_info.get('hresult')}, shutter={wpd_info.get('shutter_mechanical')}, releases={wpd_info.get('release_total')}")
+            if ptpip_info:
+                lines.append(f"  3. PTP-IP Network:        status={ptpip_info.get('status')}, latency={ptpip_info.get('elapsed_ms', 0)} ms, msg={ptpip_info.get('message')}")
+            lines.append("-" * 76)
+
+            for diag in live_result.diagnostics:
+                lines.append(f"Свойство:             {diag.property_id} ({diag.property_name})")
+                lines.append(f"  - Время запроса:    {diag.request_time}")
+                lines.append(f"  - Отправлен запрос: {diag.request_sent}")
+                lines.append(f"  - Transaction ID:   {diag.tx_id}")
+                lines.append(f"  - PTP Response:     {diag.response_code_hex}")
+                lines.append(f"  - Сырые байты (Hex):{diag.raw_bytes_hex}")
+                val_str = f"{diag.decoded_value:,}".replace(",", " ") if diag.decoded_value is not None else "—"
+                lines.append(f"  - Декодировано:     {val_str}")
+                lines.append(f"  - Статус:           {diag.status}")
+                if diag.error_message:
+                    lines.append(f"  - Ошибка/Тайм-аут:  {diag.error_message}")
+                lines.append("-" * 76)
+
+            lines.append(f"Итоговый статус:      {live_result.status}")
+            if live_result.error_message:
+                lines.append(f"Ошибка сессии:        {live_result.error_message}")
+            lines.append("=" * 76 + "\n")
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as ex:
+            dbg_log(f"Failed to write diagnostic log: {ex}")
+
+    def disconnect(self) -> None:
+        self.connected = False
+        self.active_camera = None
+
+    def export_report_text(self) -> str:
+        d = self.session_data or {}
+        lines = [
+            "============================================================",
+            f"  OpenEOS Service — Аппаратный диагностический отчёт камеры",
+            "============================================================",
+            f"Камера:               {d.get('model', '—')}",
+            f"Серийный номер:       {d.get('serial', '—')}",
+            f"Версия прошивки:      {d.get('firmware', '—')}",
+            f"Паспортный ресурс:    {d.get('rating', 0):,} срабатываний".replace(",", " "),
+            "",
+            "--- Показания затвора и ресурса ---",
+        ]
+
+        sh_m = d.get('shutter_mechanical')
+        sh_m_str = f"{sh_m:,} срабатываний".replace(",", " ") if sh_m is not None else "Не предоставлено камерой"
+        lines.append(f"Механический затвор:  {sh_m_str}")
+
+        el_s = d.get('electronic_shots')
+        el_p = d.get('electronic_pct')
+        if el_s is not None:
+            lines.append(f"Электронный затвор:   {el_s:,} ({el_p}%)".replace(",", " "))
+        else:
+            lines.append("Электронный затвор:   —")
+
+        rel_t = d.get('release_total')
+        rel_str = f"{rel_t:,}".replace(",", " ") if rel_t is not None else "—"
+        lines.append(f"Всего спусков:        {rel_str}")
+
+        wear = d.get('wear_percent')
+        wear_str = f"{wear}% от заявленного ресурса" if wear is not None else "—"
+        lines.append(f"Износ механики:       {wear_str}")
+        lines.append("")
+
+        lines.append("--- Состояние питания и наработка ---")
+        bat = d.get('battery_percent')
+        lines.append(f"Заряд аккумулятора:   {bat}%" if bat is not None else "Заряд аккумулятора:   —")
+
+        pwr = d.get('power_on_count')
+        lines.append(f"Число включений:      {pwr:,}".replace(",", " ") if pwr is not None else "Число включений:      —")
+
+        run_t = d.get('running_time')
+        lines.append(f"Общее время работы:   {run_t or '—'}")
+        lines.append("")
+
+        lines.append("--- Температурные датчики камеры ---")
+        t_img = d.get('temp_imager')
+        t_pcb = d.get('temp_pcb')
+        lines.append(f"Сенсор / Матрица:     {t_img if t_img is not None else '—'} °C")
+        lines.append(f"Плата (Main PCB):     {t_pcb if t_pcb is not None else '—'} °C")
+        lines.append("")
+
+        lines.append("--- Журнал аппаратных ошибок (Error History) ---")
+        errors = d.get("errors", [])
+        if not errors:
+            lines.append("  [OK] Аппаратных ошибок не зафиксировано (чистая сервисная история).")
+        else:
+            for i, err in enumerate(errors, 1):
+                lines.append(f"  [{i}] {err['code']} ({err['name']})")
+                lines.append(f"      Дата/время: {err['date']}")
+                lines.append(f"      При пробеге: {err['at_shutter']} кадров")
+
+        lines.extend([
+            "",
+            "============================================================",
+            f"Отчёт сформирован: OpenEOS Service v0.4.2 (Official Canon EDSDK)",
+            "============================================================",
+        ])
+        return "\n".join(lines)

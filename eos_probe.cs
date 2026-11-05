@@ -1,0 +1,856 @@
+// eos_probe.cs — OpenEOS: безопасное чтение счётчиков Canon через Windows WPD (MTP pass-through)
+// Повторяет ТОЛЬКО команды чтения из дампа Tornado (р62.pcapng, TxID 1, 9-11, 25-26, 31-32, 62-63).
+// Любая другая команда блокируется функцией Guard() до отправки в камеру.
+//
+// Сборка: C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /nologo /platform:x86 /out:eos_probe.exe eos_probe.cs
+// Запуск: eos_probe.exe info      — только стандартный запрос DeviceInfo + список vendor-опкодов (без передачи данных в камеру)
+//         eos_probe.exe counters  — info + авторизация 0x905C + чтение 0x12000001/03/05
+// Результат: eos_probe_log.txt (подробно) и JSON в stdout.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace OpenEOS.Probe
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROPERTYKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+        public PROPERTYKEY(Guid g, uint p) { fmtid = g; pid = p; }
+    }
+
+    // PROPVARIANT для x86 = 16 байт
+    [StructLayout(LayoutKind.Explicit, Size = 16)]
+    public struct PROPVARIANT
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public uint ulVal;
+        [FieldOffset(8)] public IntPtr ptr;
+    }
+
+    // ---- Интерфейсы WPD. Порядок методов = порядок vtable из PortableDeviceApi.idl / PortableDeviceTypes.idl ----
+
+    [ComImport, Guid("A1567595-4C2F-4574-A6FA-ECEF917B9A40"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPortableDeviceManager
+    {
+        [PreserveSig] int GetDevices([In, Out, MarshalAs(UnmanagedType.LPArray)] IntPtr[] pPnPDeviceIDs, ref uint pcPnPDeviceIDs);
+        [PreserveSig] int RefreshDeviceList();
+    }
+
+    [ComImport, Guid("625E2DF8-6392-4CF0-9AD1-3CFA5F17775C"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPortableDevice
+    {
+        [PreserveSig] int Open([MarshalAs(UnmanagedType.LPWStr)] string pszPnPDeviceID, IPortableDeviceValues pClientInfo);
+        [PreserveSig] int SendCommand(uint dwFlags, IPortableDeviceValues pParameters, out IPortableDeviceValues ppResults);
+        [PreserveSig] int Content(out IntPtr ppContent);
+        [PreserveSig] int Capabilities(out IntPtr ppCapabilities);
+        [PreserveSig] int Cancel();
+        [PreserveSig] int Close();
+    }
+
+    [ComImport, Guid("89B2E422-4F1B-4316-BCEF-A44AFEA83EB3"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPortableDevicePropVariantCollection
+    {
+        [PreserveSig] int GetCount(out uint pcElems);
+        [PreserveSig] int GetAt(uint dwIndex, ref PROPVARIANT pValue);
+        [PreserveSig] int Add(ref PROPVARIANT pValue);
+        [PreserveSig] int GetVarType(out ushort pvt);
+        [PreserveSig] int ChangeType(ushort vt);
+        [PreserveSig] int Clear();
+        [PreserveSig] int RemoveAt(uint dwIndex);
+    }
+
+    // ВАЖНО: первый метод — GetCount (метода IsTypeOf в этом интерфейсе нет; в старом коде vtable был сдвинут)
+    [ComImport, Guid("6848F6F2-3155-4F86-B6F5-263EEEAB3143"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPortableDeviceValues
+    {
+        [PreserveSig] int GetCount(out uint pcelt);
+        [PreserveSig] int GetAt(uint index, IntPtr pKey, IntPtr pValue);
+        [PreserveSig] int SetValue(ref PROPERTYKEY key, ref PROPVARIANT pValue);
+        [PreserveSig] int GetValue(ref PROPERTYKEY key, IntPtr pValue);
+        [PreserveSig] int SetStringValue(ref PROPERTYKEY key, [MarshalAs(UnmanagedType.LPWStr)] string Value);
+        [PreserveSig] int GetStringValue(ref PROPERTYKEY key, out IntPtr pValue);
+        [PreserveSig] int SetUnsignedIntegerValue(ref PROPERTYKEY key, uint Value);
+        [PreserveSig] int GetUnsignedIntegerValue(ref PROPERTYKEY key, out uint pValue);
+        [PreserveSig] int SetSignedIntegerValue(ref PROPERTYKEY key, int Value);
+        [PreserveSig] int GetSignedIntegerValue(ref PROPERTYKEY key, out int pValue);
+        [PreserveSig] int SetUnsignedLargeIntegerValue(ref PROPERTYKEY key, ulong Value);
+        [PreserveSig] int GetUnsignedLargeIntegerValue(ref PROPERTYKEY key, out ulong pValue);
+        [PreserveSig] int SetSignedLargeIntegerValue(ref PROPERTYKEY key, long Value);
+        [PreserveSig] int GetSignedLargeIntegerValue(ref PROPERTYKEY key, out long pValue);
+        [PreserveSig] int SetFloatValue(ref PROPERTYKEY key, float Value);
+        [PreserveSig] int GetFloatValue(ref PROPERTYKEY key, out float pValue);
+        [PreserveSig] int SetErrorValue(ref PROPERTYKEY key, int Value);
+        [PreserveSig] int GetErrorValue(ref PROPERTYKEY key, out int pValue);
+        [PreserveSig] int SetKeyValue(ref PROPERTYKEY key, ref PROPERTYKEY Value);
+        [PreserveSig] int GetKeyValue(ref PROPERTYKEY key, out PROPERTYKEY pValue);
+        [PreserveSig] int SetBoolValue(ref PROPERTYKEY key, int Value);
+        [PreserveSig] int GetBoolValue(ref PROPERTYKEY key, out int pValue);
+        [PreserveSig] int SetIUnknownValue(ref PROPERTYKEY key, IntPtr pValue);
+        [PreserveSig] int GetIUnknownValue(ref PROPERTYKEY key, out IntPtr ppValue);
+        [PreserveSig] int SetGuidValue(ref PROPERTYKEY key, ref Guid Value);
+        [PreserveSig] int GetGuidValue(ref PROPERTYKEY key, out Guid pValue);
+        [PreserveSig] int SetBufferValue(ref PROPERTYKEY key, [MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] byte[] pValue, uint cbValue);
+        [PreserveSig] int GetBufferValue(ref PROPERTYKEY key, out IntPtr ppValue, out uint pcbValue);
+        [PreserveSig] int SetIPortableDeviceValuesValue(ref PROPERTYKEY key, IPortableDeviceValues pValue);
+        [PreserveSig] int GetIPortableDeviceValuesValue(ref PROPERTYKEY key, out IPortableDeviceValues ppValue);
+        [PreserveSig] int SetIPortableDevicePropVariantCollectionValue(ref PROPERTYKEY key, IPortableDevicePropVariantCollection pValue);
+        [PreserveSig] int GetIPortableDevicePropVariantCollectionValue(ref PROPERTYKEY key, out IPortableDevicePropVariantCollection ppValue);
+        [PreserveSig] int SetIPortableDeviceKeyCollectionValue(ref PROPERTYKEY key, IntPtr pValue);
+        [PreserveSig] int GetIPortableDeviceKeyCollectionValue(ref PROPERTYKEY key, out IntPtr ppValue);
+        [PreserveSig] int SetIPortableDeviceValuesCollectionValue(ref PROPERTYKEY key, IntPtr pValue);
+        [PreserveSig] int GetIPortableDeviceValuesCollectionValue(ref PROPERTYKEY key, out IntPtr ppValue);
+        [PreserveSig] int RemoveValue(ref PROPERTYKEY key);
+        [PreserveSig] int CopyValuesFromPropertyStore(IntPtr pStore);
+        [PreserveSig] int CopyValuesToPropertyStore(IntPtr pStore);
+        [PreserveSig] int Clear();
+    }
+
+    public class PtpResult
+    {
+        public int Hr;
+        public uint ResponseCode;
+        public uint[] ResponseParams = new uint[0];
+        public byte[] Data;
+    }
+
+    public static class Program
+    {
+        // ---- Константы из PortableDevice.h (Windows SDK) ----
+        static readonly Guid WPD_CATEGORY_COMMON = new Guid("F0422A9C-5DC8-4440-B5BD-5DF28835658A");
+        static readonly Guid WPD_CATEGORY_MTP_EXT = new Guid("4D545058-1A2E-4106-A357-771E0819FC56");
+        static readonly Guid WPD_CLIENT_INFO = new Guid("204D9F0C-2292-4080-9F42-40664E70F859");
+
+        static PROPERTYKEY K_CMD_CATEGORY = new PROPERTYKEY(WPD_CATEGORY_COMMON, 1001);
+        static PROPERTYKEY K_CMD_ID = new PROPERTYKEY(WPD_CATEGORY_COMMON, 1002);
+        static PROPERTYKEY K_HRESULT = new PROPERTYKEY(WPD_CATEGORY_COMMON, 1003);
+
+        const uint CMD_GET_SUPPORTED_VENDOR_OPCODES = 11;
+        const uint CMD_EXECUTE_WITHOUT_DATA = 12;
+        const uint CMD_EXECUTE_WITH_DATA_TO_READ = 13;
+        const uint CMD_EXECUTE_WITH_DATA_TO_WRITE = 14;
+        const uint CMD_READ_DATA = 15;
+        const uint CMD_WRITE_DATA = 16;
+        const uint CMD_END_DATA_TRANSFER = 17;
+
+        static PROPERTYKEY K_OP_CODE = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1001);
+        static PROPERTYKEY K_OP_PARAMS = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1002);
+        static PROPERTYKEY K_RESP_CODE = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1003);
+        static PROPERTYKEY K_RESP_PARAMS = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1004);
+        static PROPERTYKEY K_VENDOR_OPCODES = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1005);
+        static PROPERTYKEY K_CONTEXT = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1006);
+        static PROPERTYKEY K_TOTAL_SIZE = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1007);
+        static PROPERTYKEY K_BYTES_TO_READ = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1008);
+        static PROPERTYKEY K_BYTES_READ = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1009);
+        static PROPERTYKEY K_BYTES_TO_WRITE = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1010);
+        static PROPERTYKEY K_BYTES_WRITTEN = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1011);
+        static PROPERTYKEY K_DATA = new PROPERTYKEY(WPD_CATEGORY_MTP_EXT, 1012);
+
+        static PROPERTYKEY K_CLIENT_NAME = new PROPERTYKEY(WPD_CLIENT_INFO, 2);
+        static PROPERTYKEY K_CLIENT_MAJOR = new PROPERTYKEY(WPD_CLIENT_INFO, 3);
+        static PROPERTYKEY K_CLIENT_MINOR = new PROPERTYKEY(WPD_CLIENT_INFO, 4);
+        static PROPERTYKEY K_CLIENT_REVISION = new PROPERTYKEY(WPD_CLIENT_INFO, 5);
+        static PROPERTYKEY K_CLIENT_SQOS = new PROPERTYKEY(WPD_CLIENT_INFO, 8);
+
+        static readonly Guid CLSID_PortableDeviceManager = new Guid("0AF10CEC-2ECD-4B92-9581-34F6AE0637F3");
+        static readonly Guid CLSID_PortableDeviceFTM = new Guid("F7C0039A-4762-488A-B4B3-760EF9A1BA9B");
+        static readonly Guid CLSID_PortableDeviceValues = new Guid("0C15D503-D017-47CE-9016-7B3F978721CC");
+
+        static string LogPath = "eos_probe_log.txt";
+
+        static void Log(string s)
+        {
+            string line = DateTime.Now.ToString("HH:mm:ss.fff") + " " + s;
+            try { File.AppendAllText(LogPath, line + "\r\n", Encoding.UTF8); } catch { }
+        }
+
+        // =====================================================================
+        // ЗАЩИТА: белый список. Всё, чего нет в дампе Tornado как чтение — запрещено.
+        // =====================================================================
+        // Счётчики + свойства, которые Tornado читает перед ними (дамп R6m2_live, TxID 12-24)
+        static readonly uint[] AllowedProps = { 0x12000001, 0x12000003, 0x12000005, 0x13000000,
+                                                0x00000002, 0x0100001D, 0x01000006, 0x02000005, 0x80030000 };
+        static readonly byte[] TurnOffDisplay = Hex("46415f5475726e4f6666446973706c61790000000000");
+        static readonly byte[] IsFactoryMode = Hex("4973466163746f72794d6f64650000000000");
+
+        static byte[] Hex(string h)
+        {
+            h = h.Replace(" ", "");
+            byte[] b = new byte[h.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(h.Substring(i * 2, 2), 16);
+            return b;
+        }
+
+        // Точные байты авторизации из дампа (TxID 9, 10, 11)
+        static readonly byte[] Auth1 = Hex("7361697461 6d61746368 00 01000000 04000000 00000000 00000000 01000000 0c000000 01000000 01000000 67756e6d6166756b617961 00");
+        // Фазы 2 и 3 авторизации отличаются токеном, и токен у разных камер РАЗНЫЙ.
+        // Неверный токен камера «принимает» (0x2001), но затем падает (Err 70) на FA_GetProperty —
+        // так было с R10 и R6 Mark III. Поэтому служебные запросы — только для проверенных экземпляров,
+        // токены которых взяты из дампа Tornado именно этой камеры.
+        // ModelMatchOk=true означает: токены этой модели проверены вживую на ДВУХ РАЗНЫХ
+        // физических экземплярах (2026-11-05, --force-model-match) и подошли без Err 70 —
+        // поэтому для этой модели совпадение по одной лишь модели (без сверки серийника)
+        // разрешено по умолчанию, флаг --force-model-match для неё больше не обязателен.
+        // Для моделей, проверенных только на ОДНОМ экземпляре (например R10), ModelMatchOk=false:
+        // совпадение по модели для них по-прежнему требует явного --force-model-match.
+        class CamProfile { public string Model; public string PtpSerial; public uint Token2; public uint Token3; public string Source; public bool ModelMatchOk; }
+        static readonly CamProfile[] Profiles = {
+            new CamProfile { Model = "Canon EOS R6m2", PtpSerial = "52158238494bd8c1b20eceb348b72a00", Token2 = 0x00071590, Token3 = 0x00150AD3, Source = "р62.pcapng / R6m2_live.pcapng", ModelMatchOk = true },
+            new CamProfile { Model = "Canon EOS R6m2", PtpSerial = "252c10b6274312cbcd7fb4b1a8b35540", Token2 = 0x00071590, Token3 = 0x00150AD3, Source = "--force-model-match, второй физический экземпляр, подтверждено 2026-11-05", ModelMatchOk = true },
+            new CamProfile { Model = "Canon EOS R10",  PtpSerial = "a52fcb39b240a529a9b621b771e6d456", Token2 = 0x00074218, Token3 = 0x01C2D2D2, Source = "р10.pcapng", ModelMatchOk = false },
+        };
+        static CamProfile Active;
+
+        static byte[] AuthPayload(uint token)
+        {
+            // 39 байт: "saitamatch\0" + 1 + 2 + token + 16 нулей (как TxID 10/11 в дампах)
+            byte[] b = new byte[39];
+            byte[] s = Encoding.ASCII.GetBytes("saitamatch");
+            Array.Copy(s, b, s.Length);
+            BitConverter.GetBytes((uint)1).CopyTo(b, 11);
+            BitConverter.GetBytes((uint)2).CopyTo(b, 15);
+            BitConverter.GetBytes(token).CopyTo(b, 19);
+            return b;
+        }
+
+        // ---- MonRead (openshuttercounter, канал MPU, БЕЗ ключа-авторизации) ----
+        // Формат байтов строго по docs/PROTOCOL.md openshuttercounter (проверен их тестами).
+        // Разрешены только ЧТЕНИЕ: MonOpen, MonClose, MonReadAndGetData. MonWrite/MonCall не строятся никогда.
+        static readonly uint MonAddrLo = 0x1000, MonAddrHi = 0x1030; // окно адресов MPU для сканирования
+        static byte[] MonCmd(string name, uint[][] args)
+        {
+            var ms = new System.IO.MemoryStream();
+            byte[] nm = Encoding.ASCII.GetBytes(name);
+            ms.Write(nm, 0, nm.Length); ms.WriteByte(0);            // имя + NUL
+            uint argc = (uint)(args == null ? 0 : args.Length);
+            ms.Write(BitConverter.GetBytes(argc), 0, 4);            // argc
+            if (argc == 0)
+            {
+                ms.Write(new byte[24], 0, 24);                      // паддинг 24 при argc==0
+            }
+            else
+            {
+                foreach (uint[] a in args)                          // запись 20 байт: tag,val,12 нулей
+                {
+                    ms.Write(BitConverter.GetBytes(a[0]), 0, 4);
+                    ms.Write(BitConverter.GetBytes(a[1]), 0, 4);
+                    ms.Write(new byte[12], 0, 12);
+                }
+                ms.Write(new byte[4], 0, 4);                        // +4 нуля после последней записи
+            }
+            return ms.ToArray();
+        }
+        static byte[] MonOpenP() { return MonCmd("MonOpen", null); }
+        static byte[] MonCloseP() { return MonCmd("MonClose", null); }
+        static byte[] MonReadP(uint addr, uint len) { return MonCmd("MonReadAndGetData", new uint[][] { new uint[]{2,2}, new uint[]{2,addr}, new uint[]{2,len} }); }
+
+        static bool IsAllowedMonRead(byte[] d)
+        {
+            byte[] p = MonCmd("MonReadAndGetData", new uint[][] { new uint[]{2,2}, new uint[]{2,0}, new uint[]{2,0} });
+            if (d == null || d.Length != p.Length) return false;
+            // имя + argc + arg1 фиксированы; проверяем адрес в окне и длину<=32
+            string nm = "MonReadAndGetData";
+            for (int i = 0; i < nm.Length; i++) if (d[i] != nm[i]) return false;
+            uint argc = BitConverter.ToUInt32(d, 18); if (argc != 3) return false;
+            uint tag2 = BitConverter.ToUInt32(d, 22); uint v1 = BitConverter.ToUInt32(d, 26); if (tag2 != 2 || v1 != 2) return false;
+            uint addr = BitConverter.ToUInt32(d, 46); uint len = BitConverter.ToUInt32(d, 66);
+            return addr >= MonAddrLo && addr <= MonAddrHi && len > 0 && len <= 32;
+        }
+
+        static byte[] FaGetProperty(uint prop)
+        {
+            // 43 байта: "FA_GetProperty\0" + argc=1 + tag=2 + key + 16 нулей (как в TxID 25)
+            byte[] b = new byte[43];
+            byte[] name = Encoding.ASCII.GetBytes("FA_GetProperty");
+            Array.Copy(name, b, name.Length);
+            BitConverter.GetBytes((uint)1).CopyTo(b, 15);
+            BitConverter.GetBytes((uint)2).CopyTo(b, 19);
+            BitConverter.GetBytes(prop).CopyTo(b, 23);
+            return b;
+        }
+
+        static bool SameBytes(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        static void Guard(uint op, byte[] outData)
+        {
+            bool ok = false;
+            if (op == 0x1001 && outData == null) ok = true;                 // GetDeviceInfo (чтение)
+            else if (op == 0x9116 && outData == null) ok = true;            // Canon GetEvent (чтение), TxID 8
+            else if ((op == 0x9114 || op == 0x9115) && outData == null) ok = true; // SetRemoteMode(1)/SetEventMode(1) как EDSDK, TxID 6-7
+            else if (op == 0x9053 && outData == null) ok = true;            // забрать ответ (чтение)
+            else if (op == 0x905C && Active != null && (SameBytes(outData, Auth1) || SameBytes(outData, AuthPayload(Active.Token2)) || SameBytes(outData, AuthPayload(Active.Token3)))) ok = true;
+            else if (op == 0x9052 && (SameBytes(outData, MonOpenP()) || SameBytes(outData, MonCloseP()) || IsAllowedMonRead(outData))) ok = true; // MonRead-канал (чтение памяти, без ключа)
+            else if (op == 0x911B && outData == null) ok = true;            // SetUILock(1), TxID 18
+            else if (op == 0x9052 && (SameBytes(outData, TurnOffDisplay) || SameBytes(outData, IsFactoryMode))) ok = true; // TxID 14-15
+            else if (op == 0x9052 && outData != null)
+            {
+                foreach (uint p in AllowedProps) if (SameBytes(outData, FaGetProperty(p))) ok = true;
+            }
+            if (!ok)
+            {
+                Log(string.Format("GUARD BLOCKED op=0x{0:X4} len={1}", op, outData == null ? 0 : outData.Length));
+                throw new InvalidOperationException(string.Format("Команда 0x{0:X4} заблокирована защитой", op));
+            }
+        }
+
+        // =====================================================================
+        // COM-хелперы
+        // =====================================================================
+        static object Create(Guid clsid)
+        {
+            return Activator.CreateInstance(Type.GetTypeFromCLSID(clsid, true));
+        }
+
+        static IPortableDeviceValues NewValues()
+        {
+            return (IPortableDeviceValues)Create(CLSID_PortableDeviceValues);
+        }
+
+        static IPortableDevicePropVariantCollection NewCollection()
+        {
+            Type t = Type.GetTypeFromProgID("PortableDeviceTypes.PortableDevicePropVariantCollection", false);
+            if (t == null) t = Type.GetTypeFromCLSID(new Guid("08A99E2F-6D6D-4B80-AF5A-BAF2BCBE4CB9"), true);
+            return (IPortableDevicePropVariantCollection)Activator.CreateInstance(t);
+        }
+
+        static IPortableDeviceValues NewCommand(uint cmdId)
+        {
+            IPortableDeviceValues v = NewValues();
+            Guid cat = WPD_CATEGORY_MTP_EXT;
+            v.SetGuidValue(ref K_CMD_CATEGORY, ref cat);
+            v.SetUnsignedIntegerValue(ref K_CMD_ID, cmdId);
+            return v;
+        }
+
+        static void SetParams(IPortableDeviceValues cmd, uint[] ps)
+        {
+            IPortableDevicePropVariantCollection c = NewCollection();
+            c.ChangeType(19); // VT_UI4
+            if (ps != null)
+                foreach (uint p in ps)
+                {
+                    PROPVARIANT pv = new PROPVARIANT();
+                    pv.vt = 19; pv.ulVal = p;
+                    c.Add(ref pv);
+                }
+            cmd.SetIPortableDevicePropVariantCollectionValue(ref K_OP_PARAMS, c);
+        }
+
+        static int Send(IPortableDevice dev, IPortableDeviceValues cmd, out IPortableDeviceValues res)
+        {
+            int hr = dev.SendCommand(0, cmd, out res);
+            if (hr == 0 && res != null)
+            {
+                int inner;
+                if (res.GetErrorValue(ref K_HRESULT, out inner) == 0 && inner != 0) hr = inner;
+            }
+            return hr;
+        }
+
+        static void ReadResponse(IPortableDeviceValues res, PtpResult r)
+        {
+            if (res == null) return;
+            uint rc;
+            if (res.GetUnsignedIntegerValue(ref K_RESP_CODE, out rc) == 0) r.ResponseCode = rc;
+            IPortableDevicePropVariantCollection c;
+            if (res.GetIPortableDevicePropVariantCollectionValue(ref K_RESP_PARAMS, out c) == 0 && c != null)
+            {
+                uint n; c.GetCount(out n);
+                List<uint> l = new List<uint>();
+                for (uint i = 0; i < n; i++)
+                {
+                    PROPVARIANT pv = new PROPVARIANT();
+                    if (c.GetAt(i, ref pv) == 0) l.Add(pv.ulVal);
+                }
+                r.ResponseParams = l.ToArray();
+            }
+        }
+
+        static string GetContext(IPortableDeviceValues res)
+        {
+            IntPtr p;
+            if (res.GetStringValue(ref K_CONTEXT, out p) == 0 && p != IntPtr.Zero)
+            {
+                string s = Marshal.PtrToStringUni(p);
+                Marshal.FreeCoTaskMem(p);
+                return s;
+            }
+            return null;
+        }
+
+        static PtpResult EndTransfer(IPortableDevice dev, string context, PtpResult r)
+        {
+            IPortableDeviceValues cmd = NewCommand(CMD_END_DATA_TRANSFER);
+            if (context != null) cmd.SetStringValue(ref K_CONTEXT, context);
+            IPortableDeviceValues res;
+            int hr = Send(dev, cmd, out res);
+            if (r.Hr == 0) r.Hr = hr;
+            ReadResponse(res, r);
+            return r;
+        }
+
+        // Команда с получением данных от камеры (чтение)
+        static PtpResult ExecRead(IPortableDevice dev, uint op, uint[] ps)
+        {
+            Guard(op, null);
+            PtpResult r = new PtpResult();
+            IPortableDeviceValues cmd = NewCommand(CMD_EXECUTE_WITH_DATA_TO_READ);
+            cmd.SetUnsignedIntegerValue(ref K_OP_CODE, op);
+            SetParams(cmd, ps);
+            IPortableDeviceValues res;
+            r.Hr = Send(dev, cmd, out res);
+            if (r.Hr != 0) { Log(string.Format("ExecRead op=0x{0:X4} hr=0x{1:X8}", op, r.Hr)); return r; }
+            string ctx = GetContext(res);
+            ulong total = 0;
+            res.GetUnsignedLargeIntegerValue(ref K_TOTAL_SIZE, out total);
+
+            List<byte> all = new List<byte>();
+            uint chunk = 0x10000;
+            int guard = 0;
+            while ((ulong)all.Count < total && guard++ < 1000)
+            {
+                uint want = (uint)Math.Min((ulong)chunk, total - (ulong)all.Count);
+                IPortableDeviceValues rc = NewCommand(CMD_READ_DATA);
+                if (ctx != null) rc.SetStringValue(ref K_CONTEXT, ctx);
+                rc.SetUnsignedIntegerValue(ref K_BYTES_TO_READ, want);
+                rc.SetBufferValue(ref K_DATA, new byte[want], want);
+                IPortableDeviceValues rr;
+                int hr = Send(dev, rc, out rr);
+                if (hr != 0 || rr == null) { r.Hr = hr; Log(string.Format("READ_DATA hr=0x{0:X8}", hr)); break; }
+                uint got = 0;
+                rr.GetUnsignedIntegerValue(ref K_BYTES_READ, out got);
+                IntPtr pb; uint cb;
+                if (rr.GetBufferValue(ref K_DATA, out pb, out cb) == 0 && pb != IntPtr.Zero)
+                {
+                    uint n = Math.Min(got > 0 ? got : cb, cb);
+                    byte[] tmp = new byte[n];
+                    Marshal.Copy(pb, tmp, 0, (int)n);
+                    Marshal.FreeCoTaskMem(pb);
+                    all.AddRange(tmp);
+                    if (n == 0) break;
+                }
+                else break;
+            }
+            r.Data = all.ToArray();
+            EndTransfer(dev, ctx, r);
+            Log(string.Format("ExecRead op=0x{0:X4} params=[{1}] hr=0x{2:X8} resp=0x{3:X4} rparams=[{4}] bytes={5}",
+                op, J(ps), r.Hr, r.ResponseCode, J(r.ResponseParams), r.Data.Length));
+            return r;
+        }
+
+        // Команда без фазы данных (только параметры)
+        static PtpResult ExecNoData(IPortableDevice dev, uint op, uint[] ps)
+        {
+            Guard(op, null);
+            if ((op == 0x9114 || op == 0x9115 || op == 0x911B) && (ps == null || ps.Length != 1 || ps[0] != 1))
+                throw new InvalidOperationException("Команда заблокирована защитой (параметры)");
+            PtpResult r = new PtpResult();
+            IPortableDeviceValues cmd = NewCommand(CMD_EXECUTE_WITHOUT_DATA);
+            cmd.SetUnsignedIntegerValue(ref K_OP_CODE, op);
+            SetParams(cmd, ps);
+            IPortableDeviceValues res;
+            r.Hr = Send(dev, cmd, out res);
+            ReadResponse(res, r);
+            Log(string.Format("ExecNoData op=0x{0:X4} params=[{1}] hr=0x{2:X8} resp=0x{3:X4} rparams=[{4}]",
+                op, J(ps), r.Hr, r.ResponseCode, J(r.ResponseParams)));
+            return r;
+        }
+
+        // Команда с передачей запроса в камеру (сам запрос, НЕ запись в память камеры)
+        static PtpResult ExecSend(IPortableDevice dev, uint op, uint[] ps, byte[] data)
+        {
+            Guard(op, data);
+            PtpResult r = new PtpResult();
+            IPortableDeviceValues cmd = NewCommand(CMD_EXECUTE_WITH_DATA_TO_WRITE);
+            cmd.SetUnsignedIntegerValue(ref K_OP_CODE, op);
+            SetParams(cmd, ps);
+            cmd.SetUnsignedLargeIntegerValue(ref K_TOTAL_SIZE, (ulong)data.Length);
+            IPortableDeviceValues res;
+            r.Hr = Send(dev, cmd, out res);
+            if (r.Hr != 0) { Log(string.Format("ExecSend op=0x{0:X4} hr=0x{1:X8}", op, r.Hr)); return r; }
+            string ctx = GetContext(res);
+
+            IPortableDeviceValues wc = NewCommand(CMD_WRITE_DATA);
+            if (ctx != null) wc.SetStringValue(ref K_CONTEXT, ctx);
+            wc.SetUnsignedIntegerValue(ref K_BYTES_TO_WRITE, (uint)data.Length);
+            wc.SetBufferValue(ref K_DATA, data, (uint)data.Length);
+            IPortableDeviceValues wr;
+            int hr2 = Send(dev, wc, out wr);
+            if (hr2 != 0) { r.Hr = hr2; Log(string.Format("WRITE_DATA hr=0x{0:X8}", hr2)); }
+            EndTransfer(dev, ctx, r);
+            Log(string.Format("ExecSend op=0x{0:X4} params=[{1}] len={2} hr=0x{3:X8} resp=0x{4:X4} rparams=[{5}]",
+                op, J(ps), data.Length, r.Hr, r.ResponseCode, J(r.ResponseParams)));
+            return r;
+        }
+
+        static string J(uint[] a)
+        {
+            if (a == null) return "";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < a.Length; i++) { if (i > 0) sb.Append(","); sb.Append("0x" + a[i].ToString("X")); }
+            return sb.ToString();
+        }
+
+        static string HexStr(byte[] b)
+        {
+            if (b == null) return "";
+            StringBuilder sb = new StringBuilder();
+            foreach (byte x in b) sb.Append(x.ToString("x2"));
+            return sb.ToString();
+        }
+
+        static string Esc(string s)
+        {
+            if (s == null) return "";
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in s)
+            {
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c < 32) sb.Append(' ');
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        // ---- Разбор стандартного PTP DeviceInfo ----
+        static int pos;
+        static ushort U16(byte[] b) { ushort v = BitConverter.ToUInt16(b, pos); pos += 2; return v; }
+        static uint U32(byte[] b) { uint v = BitConverter.ToUInt32(b, pos); pos += 4; return v; }
+        static string PStr(byte[] b)
+        {
+            int n = b[pos++];
+            if (n == 0) return "";
+            string s = Encoding.Unicode.GetString(b, pos, n * 2).TrimEnd('\0');
+            pos += n * 2;
+            return s;
+        }
+        static ushort[] U16Arr(byte[] b)
+        {
+            uint n = U32(b);
+            ushort[] a = new ushort[n];
+            for (int i = 0; i < n; i++) a[i] = U16(b);
+            return a;
+        }
+
+        public class DevInfo { public string Manufacturer = "", Model = "", Version = "", Serial = ""; public ushort[] Ops = new ushort[0]; }
+
+        static DevInfo ParseDeviceInfo(byte[] b)
+        {
+            DevInfo d = new DevInfo();
+            pos = 0;
+            U16(b); U32(b); U16(b); PStr(b); U16(b);
+            d.Ops = U16Arr(b);
+            U16Arr(b); U16Arr(b); U16Arr(b); U16Arr(b);
+            d.Manufacturer = PStr(b); d.Model = PStr(b); d.Version = PStr(b); d.Serial = PStr(b);
+            return d;
+        }
+
+        static bool HasOp(ushort[] ops, ushort op) { foreach (ushort o in ops) if (o == op) return true; return false; }
+
+        // =====================================================================
+        [STAThread]
+        static int Main(string[] args)
+        {
+            string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "info";
+            try { LogPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "eos_probe_log.txt"); } catch { }
+            if (args.Length > 1 && !string.IsNullOrEmpty(args[1])) LogPath = args[1];
+            // ЭКСПЕРИМЕНТАЛЬНЫЙ флаг (третий аргумент): осознанно пробует уже известные
+            // РЕАЛЬНЫЕ токены (не выдуманные) с дампа другого физического экземпляра той
+            // же модели, на серийнике, под который они не проверялись. Используется только
+            // для проверки гипотезы "токен общий для модели vs привязан к экземпляру" —
+            // по явному запросу пользователя, не включено по умолчанию нигде.
+            bool forceModelMatch = args.Length > 2 && args[2] == "--force-model-match";
+            Log("=== eos_probe mode=" + mode + " === build=v7-mon" + (forceModelMatch ? " [ЭКСПЕРИМЕНТ: --force-model-match]" : ""));
+
+            var json = new StringBuilder();
+            bool success = false;
+            string message = "";
+            string deviceId = "";
+            DevInfo di = null;
+            string vendorOps = "";
+            uint authResp = 0;
+            long mech = -1, total = -1, powerOn = -1, uptime = -1;
+            string raw01 = "", raw03 = "", raw05 = "", raw13 = "";
+            string monJson = "null";
+            string errorLogJson = "null";
+            string stage = "start";
+            IPortableDevice dev = null;
+
+            try
+            {
+                stage = "enumerate";
+                IPortableDeviceManager mgr = (IPortableDeviceManager)Create(CLSID_PortableDeviceManager);
+                mgr.RefreshDeviceList();
+                uint count = 0;
+                mgr.GetDevices(null, ref count);
+                IntPtr[] ids = new IntPtr[count];
+                if (count > 0) mgr.GetDevices(ids, ref count);
+                for (int i = 0; i < count; i++)
+                {
+                    string id = Marshal.PtrToStringUni(ids[i]);
+                    Marshal.FreeCoTaskMem(ids[i]);
+                    Log("WPD device: " + id);
+                    if (deviceId == "" && id.ToLowerInvariant().Contains("vid_04a9")) deviceId = id;
+                }
+                if (deviceId == "") throw new Exception("Камера Canon не найдена. Проверьте кабель, включите камеру, закройте EOS Utility.");
+
+                stage = "open";
+                dev = (IPortableDevice)Create(CLSID_PortableDeviceFTM);
+                IPortableDeviceValues ci = NewValues();
+                ci.SetStringValue(ref K_CLIENT_NAME, "OpenEOS Probe");
+                ci.SetUnsignedIntegerValue(ref K_CLIENT_MAJOR, 1);
+                ci.SetUnsignedIntegerValue(ref K_CLIENT_MINOR, 0);
+                ci.SetUnsignedIntegerValue(ref K_CLIENT_REVISION, 0);
+                ci.SetUnsignedIntegerValue(ref K_CLIENT_SQOS, 0x20000); // SECURITY_IMPERSONATION
+                int hrOpen = dev.Open(deviceId, ci);
+                Log(string.Format("Open hr=0x{0:X8}", hrOpen));
+                if (hrOpen != 0) throw new Exception(string.Format("Не удалось открыть камеру (0x{0:X8}). Закройте EOS Utility и другие программы Canon.", hrOpen));
+
+                stage = "vendor_opcodes";
+                {
+                    IPortableDeviceValues cmd = NewCommand(CMD_GET_SUPPORTED_VENDOR_OPCODES);
+                    IPortableDeviceValues res;
+                    int hr = Send(dev, cmd, out res);
+                    List<string> l = new List<string>();
+                    IPortableDevicePropVariantCollection c;
+                    if (hr == 0 && res != null && res.GetIPortableDevicePropVariantCollectionValue(ref K_VENDOR_OPCODES, out c) == 0 && c != null)
+                    {
+                        uint n; c.GetCount(out n);
+                        for (uint i = 0; i < n; i++) { PROPVARIANT pv = new PROPVARIANT(); if (c.GetAt(i, ref pv) == 0) l.Add("0x" + pv.ulVal.ToString("X4")); }
+                    }
+                    vendorOps = string.Join(",", l.ToArray());
+                    Log(string.Format("GetSupportedVendorOpcodes hr=0x{0:X8} count={1}: {2}", hr, l.Count, vendorOps));
+                }
+
+                stage = "device_info";
+                PtpResult info = ExecRead(dev, 0x1001, new uint[0]);
+                if (info.Hr != 0 || info.ResponseCode != 0x2001 || info.Data == null || info.Data.Length < 10)
+                    throw new Exception(string.Format("GetDeviceInfo не прошёл: hr=0x{0:X8} resp=0x{1:X4}", info.Hr, info.ResponseCode));
+                di = ParseDeviceInfo(info.Data);
+                Log(string.Format("DeviceInfo: {0} | {1} | FW {2} | SN {3} | ops={4}", di.Manufacturer, di.Model, di.Version, di.Serial, di.Ops.Length));
+                Log("Supports 0x905C=" + HasOp(di.Ops, 0x905C) + " 0x9052=" + HasOp(di.Ops, 0x9052) + " 0x9053=" + HasOp(di.Ops, 0x9053));
+
+                if (mode == "info")
+                {
+                    success = true;
+                    message = "Связь с камерой работает (только чтение DeviceInfo).";
+                }
+                else if (mode == "counters")
+                {
+                    // Служебные запросы — ТОЛЬКО для моделей, проверенных на живой камере.
+                    // R10 (FW 1.3.0) и R6 Mark III (FW 1.0.2) на FA_GetProperty аварийно выключаются (Err 70) — запрещены.
+                    foreach (CamProfile pr in Profiles)
+                        if (pr.Model == di.Model && pr.PtpSerial == di.Serial) Active = pr;
+                    if (Active != null) Log("Profile: " + Active.Model + " (tokens from " + Active.Source + ", exact serial match)");
+                    if (Active == null)
+                    {
+                        // Совпадение только по модели (без сверки серийника) разрешено по умолчанию
+                        // ТОЛЬКО для моделей с ModelMatchOk=true (подтверждено на 2+ разных экземплярах).
+                        // Для остальных моделей — только по явному --force-model-match (эксперимент).
+                        foreach (CamProfile pr in Profiles)
+                        {
+                            if (pr.Model != di.Model) continue;
+                            if (pr.ModelMatchOk) { Active = pr; break; }
+                            if (forceModelMatch) { Active = pr; break; }
+                        }
+                        if (Active != null && Active.ModelMatchOk)
+                            Log("Серийник " + di.Serial + " не совпал с " + Active.PtpSerial +
+                                " — применяю токены " + Active.Source + " по совпадению модели " +
+                                "(разрешено по умолчанию: эта модель подтверждена на 2+ разных экземплярах).");
+                        else if (Active != null)
+                            Log("ЭКСПЕРИМЕНТ: серийник " + di.Serial + " не совпал с " + Active.PtpSerial +
+                                " — применяю токены " + Active.Source + " по совпадению ТОЛЬКО модели (--force-model-match). " +
+                                "Если камера ответит Err 70/зависанием — это и есть ответ: токен привязан к экземпляру, не к модели.");
+                    }
+                    if (Active == null)
+                        throw new Exception("Модель " + di.Model + " не проверена. Служебные запросы не отправлялись, камера в безопасности.");
+
+                    // Подготовка как в дампе Tornado (TxID 6, 7, 8) — стандартный старт сессии EDSDK
+                    stage = "remote_mode";
+                    PtpResult rm = ExecNoData(dev, 0x9114, new uint[] { 1 });
+                    if (rm.Hr != 0 || rm.ResponseCode != 0x2001)
+                        throw new Exception(string.Format("Камера не приняла SetRemoteMode: hr=0x{0:X8} resp=0x{1:X4}", rm.Hr, rm.ResponseCode));
+                    stage = "event_mode";
+                    PtpResult em = ExecNoData(dev, 0x9115, new uint[] { 1 });
+                    if (em.Hr != 0 || em.ResponseCode != 0x2001)
+                        throw new Exception(string.Format("Камера не приняла SetEventMode: hr=0x{0:X8} resp=0x{1:X4}", em.Hr, em.ResponseCode));
+                    stage = "get_event";
+                    PtpResult ge = ExecRead(dev, 0x9116, new uint[] { 0, 0, 1 });
+                    if (ge.Hr != 0 || ge.ResponseCode != 0x2001)
+                        throw new Exception(string.Format("Камера не ответила на GetEvent: hr=0x{0:X8} resp=0x{1:X4}", ge.Hr, ge.ResponseCode));
+
+                    stage = "auth";
+                    PtpResult a1 = ExecSend(dev, 0x905C, new uint[0], Auth1);
+                    PtpResult a2 = (a1.ResponseCode == 0x2001) ? ExecSend(dev, 0x905C, new uint[0], AuthPayload(Active.Token2)) : a1;
+                    PtpResult a3 = (a2.ResponseCode == 0x2001) ? ExecSend(dev, 0x905C, new uint[0], AuthPayload(Active.Token3)) : a2;
+                    authResp = a3.ResponseCode;
+                    if (a3.Hr != 0 || a3.ResponseCode != 0x2001)
+                        throw new Exception(string.Format("Камера не приняла авторизацию: hr=0x{0:X8} resp=0x{1:X4}", a3.Hr, a3.ResponseCode));
+
+                    // Подготовка перед чтением счётчиков — точно как Tornado (дамп R6m2_live.pcapng, TxID 12-24).
+                    // Без неё камера отдаёт сохранённую (несвежую) копию механического счётчика.
+                    stage = "prep";
+                    // Паузы повторяют тайминг Tornado из дампа: камера обновляет сохранённый счётчик
+                    // не мгновенно, Tornado читает затвор через ~1.3 с после FA_TurnOffDisplay.
+                    if (ReadProp(dev, 0x00000002, new uint[0]) == null) throw new Exception("Подготовка: камера не ответила (шаг 1).");
+                    System.Threading.Thread.Sleep(1000);
+                    PtpResult td = ExecSend(dev, 0x9052, new uint[] { 0, 0 }, TurnOffDisplay);
+                    if (td.Hr != 0 || td.ResponseCode != 0x2001) throw new Exception("Подготовка: камера не приняла шаг 2.");
+                    System.Threading.Thread.Sleep(80);
+                    PtpResult fm = ExecSend(dev, 0x9052, new uint[] { 0, 0 }, IsFactoryMode);
+                    if (fm.Hr != 0 || fm.ResponseCode != 0x2001) throw new Exception("Подготовка: камера не приняла шаг 3.");
+                    if (ReadProp(dev, 0x0100001D, new uint[] { 0, 0, 1 }) == null) throw new Exception("Подготовка: камера не ответила (шаг 4).");
+                    // SetUILock может вернуть 0x2019 (Device Busy) — повторяем, и в любом случае продолжаем чтение
+                    PtpResult ul = null;
+                    for (int attempt = 0; attempt < 5; attempt++)
+                    {
+                        ul = ExecNoData(dev, 0x911B, new uint[] { 1 });
+                        if (ul.Hr == 0 && ul.ResponseCode == 0x2001) break;
+                        System.Threading.Thread.Sleep(400);
+                    }
+                    if (ul.Hr != 0 || ul.ResponseCode != 0x2001) Log("WARN prep step 5 (SetUILock) not accepted, continuing");
+                    if (ReadProp(dev, 0x01000006, new uint[0]) == null) throw new Exception("Подготовка: камера не ответила (шаг 6).");
+                    System.Threading.Thread.Sleep(840);
+                    if (ReadProp(dev, 0x02000005, new uint[] { 0, 0, 1 }) == null) throw new Exception("Подготовка: камера не ответила (шаг 7).");
+                    if (ReadProp(dev, 0x80030000, new uint[] { 0, 0, 1 }) == null) throw new Exception("Подготовка: камера не ответила (шаг 8).");
+                    System.Threading.Thread.Sleep(310);
+
+                    stage = "read_0x12000001";
+                    byte[] d01 = ReadProp(dev, 0x12000001, new uint[0]);
+                    if (d01 == null) throw new Exception("Камера не ответила на запрос счётчика затвора. Дальнейшие запросы не отправлялись. Модель пока не поддерживается — выключите и включите камеру.");
+                    stage = "read_0x12000003";
+                    byte[] d03 = ReadProp(dev, 0x12000003, new uint[0]);
+                    stage = "read_0x12000005";
+                    byte[] d05 = (d03 != null) ? ReadProp(dev, 0x12000005, new uint[] { 0, 0, 1 }) : null;
+
+                    // Журнал ошибок: свойство 0x13000000 (дамп Tornado, TxID 33-34), записи по 16 байт
+                    stage = "read_0x13000000";
+                    byte[] d13 = (d05 != null) ? ReadProp(dev, 0x13000000, new uint[0]) : null;
+                    raw13 = HexStr(d13);
+                    if (d13 != null)
+                    {
+                        List<string> items = new List<string>();
+                        for (int o = 0; o + 16 <= d13.Length; o += 16)
+                        {
+                            uint ts = BitConverter.ToUInt32(d13, o);
+                            if (ts == 0xFFFFFFFF || ts < 1000000000) continue;   // пусто или мусор (напр. ts=1, code=FFFF)
+                            ushort code = BitConverter.ToUInt16(d13, o + 8);
+                            uint atRel = BitConverter.ToUInt32(d13, o + 12);
+                            if (code == 0xFFFF || atRel == 0xFFFFFFFF) continue;
+                            byte[] rec = new byte[16]; Array.Copy(d13, o, rec, 0, 16);
+                            ushort lensId = BitConverter.ToUInt16(d13, o + 4);
+                            items.Add(string.Format("{{\"slot\": {0}, \"time\": {1}, \"code\": {2}, \"at_release\": {3}, \"lens_id\": {4}, \"raw\": \"{5}\"}}",
+                                o / 16 + 1, ts, code, atRel, lensId, HexStr(rec)));
+                        }
+                        errorLogJson = "[" + string.Join(", ", items.ToArray()) + "]";
+                        Log("ErrorLog records=" + items.Count);
+                    }
+
+                    raw01 = HexStr(d01); raw03 = HexStr(d03); raw05 = HexStr(d05);
+                    if (d01 != null && d01.Length >= 4) mech = BitConverter.ToUInt32(d01, 0);
+                    if (d03 != null && d03.Length >= 4) total = BitConverter.ToUInt32(d03, 0);
+                    if (d05 != null && d05.Length >= 8) { powerOn = BitConverter.ToUInt32(d05, 0); uptime = BitConverter.ToUInt32(d05, 4); }
+                    Log(string.Format("RESULT mech={0} total={1} powerOn={2} uptime={3}", mech, total, powerOn, uptime));
+                    success = mech >= 0 || total >= 0;
+                    message = success ? "Счётчики прочитаны с камеры." : "Камера не вернула значения счётчиков (модель может не поддерживаться).";
+                }
+                else if (mode == "mon")
+                {
+                    // openshuttercounter-канал: БЕЗ авторизации, БЕЗ сервисного режима.
+                    // Только MonOpen -> MonReadAndGetData по диапазону адресов -> MonClose. Запись в камеру не выполняется.
+                    stage = "mon_open";
+                    PtpResult mo = ExecSend(dev, 0x9052, new uint[] { 0, 1 }, MonOpenP());
+                    Log(string.Format("MonOpen resp=0x{0:X4} hr=0x{1:X8}", mo.ResponseCode, mo.Hr));
+                    if (mo.Hr != 0 || (mo.ResponseCode != 0x2001 && mo.ResponseCode != 0x0000))
+                        throw new Exception(string.Format("MonOpen отклонён камерой: resp=0x{0:X4} (канал MPU, видимо, не поддерживается этой моделью).", mo.ResponseCode));
+
+                    var items = new List<string>();
+                    stage = "mon_read";
+                    for (uint addr = MonAddrLo; addr <= MonAddrHi; addr++)
+                    {
+                        PtpResult q = ExecSend(dev, 0x9052, new uint[] { 0, 1 }, MonReadP(addr, 10));
+                        byte[] rd = null;
+                        if (q.Hr == 0 && q.ResponseCode == 0x2001)
+                        {
+                            PtpResult f = ExecRead(dev, 0x9053, new uint[0]);
+                            if (f.Hr == 0 && f.ResponseCode == 0x2001) rd = f.Data;
+                        }
+                        string hex = HexStr(rd);
+                        long dec = -1;
+                        if (rd != null && rd.Length >= 2)
+                        {
+                            int low = 0;
+                            for (int b = 2; b < rd.Length; b++) if (rd[b] != 0) low = rd[b]; // последний ненулевой после offset1
+                            dec = (rd[1] << 8) | low;
+                        }
+                        items.Add(string.Format("{{\"addr\": \"0x{0:X4}\", \"resp\": \"0x{1:X4}\", \"raw\": \"{2}\", \"decoded\": {3}}}",
+                            addr, q.ResponseCode, hex, dec));
+                        Log(string.Format("Mon 0x{0:X4} resp=0x{1:X4} raw={2}", addr, q.ResponseCode, hex));
+                    }
+
+                    stage = "mon_close";
+                    ExecSend(dev, 0x9052, new uint[] { 0, 1 }, MonCloseP());
+
+                    monJson = "[" + string.Join(", ", items.ToArray()) + "]";
+                    success = mo.ResponseCode == 0x2001 || mo.ResponseCode == 0x0000;
+                    message = success ? "Канал MPU (MonRead) отвечает. Сверьте адреса с известным счётчиком." : "Канал MPU не поддерживается.";
+                }
+                stage = "done";
+            }
+            catch (Exception ex)
+            {
+                message = ex.Message;
+                Log("ERROR at " + stage + ": " + ex.ToString());
+            }
+            finally
+            {
+                if (dev != null) { try { dev.Close(); } catch { } }
+            }
+
+            json.Append("{");
+            json.AppendFormat("\"success\": {0}, ", success ? "true" : "false");
+            json.AppendFormat("\"mode\": \"{0}\", \"stage\": \"{1}\", ", Esc(mode), Esc(stage));
+            json.AppendFormat("\"message\": \"{0}\", ", Esc(message));
+            json.AppendFormat("\"device_id\": \"{0}\", ", Esc(deviceId));
+            json.AppendFormat("\"manufacturer\": \"{0}\", \"model\": \"{1}\", \"firmware\": \"{2}\", \"serial\": \"{3}\", ",
+                Esc(di != null ? di.Manufacturer : ""), Esc(di != null ? di.Model : ""), Esc(di != null ? di.Version : ""), Esc(di != null ? di.Serial : ""));
+            json.AppendFormat("\"driver_vendor_opcodes\": \"{0}\", ", Esc(vendorOps));
+            json.AppendFormat("\"auth_response\": \"0x{0:X4}\", ", authResp);
+            json.AppendFormat("\"shutter_mechanical\": {0}, ", mech >= 0 ? mech.ToString() : "null");
+            json.AppendFormat("\"release_total\": {0}, ", total >= 0 ? total.ToString() : "null");
+            json.AppendFormat("\"shutter_electronic\": {0}, ", (mech >= 0 && total >= mech) ? (total - mech).ToString() : "null");
+            json.AppendFormat("\"power_on_count\": {0}, ", powerOn >= 0 ? powerOn.ToString() : "null");
+            json.AppendFormat("\"uptime_seconds\": {0}, ", uptime >= 0 ? uptime.ToString() : "null");
+            json.AppendFormat("\"raw_0x12000001\": \"{0}\", \"raw_0x12000003\": \"{1}\", \"raw_0x12000005\": \"{2}\", ", raw01, raw03, raw05);
+            json.AppendFormat("\"raw_0x13000000\": \"{0}\", \"error_log\": {1}, ", raw13, errorLogJson);
+            json.AppendFormat("\"mon_scan\": {0}", monJson);
+            json.Append("}");
+            Console.OutputEncoding = Encoding.UTF8;
+            Console.WriteLine(json.ToString());
+            Log("JSON " + json.ToString());
+            return success ? 0 : 1;
+        }
+
+        static byte[] ReadProp(IPortableDevice dev, uint prop, uint[] fetchParams)
+        {
+            PtpResult q = ExecSend(dev, 0x9052, new uint[] { 0, 1 }, FaGetProperty(prop));
+            if (q.Hr != 0 || q.ResponseCode != 0x2001)
+            {
+                Log(string.Format("FA_GetProperty 0x{0:X8} rejected hr=0x{1:X8} resp=0x{2:X4}", prop, q.Hr, q.ResponseCode));
+                return null;
+            }
+            PtpResult f = ExecRead(dev, 0x9053, fetchParams);
+            if (f.Hr != 0 || f.ResponseCode != 0x2001) return null;
+            return f.Data;
+        }
+    }
+}
