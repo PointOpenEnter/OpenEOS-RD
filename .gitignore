@@ -1,0 +1,27 @@
+# Git ignore for OpenEOS Community Edition
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Private Pro edition & USB hardware diagnostics (Local Only!)
+openeos_pro.py
+canon_ptp.py
+eos_probe.*
+app_icon_pro.*
+*PRO*.bat
+*pro*.bat
+build_nuitka.py
+publish_github.py
+Опубликовать_на_GitHub.bat
+AGENT_TASK.md
+copy_probe.py
+create_icons.py
+*.pcap
+*.pcapng
+*.txt
+*.log
+
+# Build artifacts
+build/
+dist/
+*.spec
