@@ -1,0 +1,4 @@
+# Keep GitHub language stats focused on the Rust source
+dist/** linguist-vendored
+Cargo.lock linguist-generated
+*.exe binary
