@@ -1,49 +1,25 @@
-# OpenEOS (Community Edition)
+# OpenEOS
 
-**OpenEOS** — легковесная кроссплатформенная утилита для фотографов, позволяющая определить реальный пробег и состояние затвора цифровых камер.
+A small native desktop tool (Rust, egui) that reads the shutter actuation / image count from photo files and prepares SD cards.
 
-Работает полностью локально, запускается за долю секунды и не требует установки тяжелых внешних утилит или Perl.
+## Features
 
----
+- **RAW / EXIF analysis** - reads the shutter count (image counter) and camera model from EXIF / maker-notes of Canon, Sony, Nikon and Fujifilm files, and shows it against the rated shutter life of the model.
+- **SD card preparation** - formats a card to FAT32 and writes the Canon Basic script files.
 
-## Возможности
+Supported file types: `.NEF`, `.ARW`, `.CR2`, `.CR3`, `.RAF`, `.JPG` / `.JPEG`. Drag a file onto the window or pick it with the file dialog.
 
-1. **📁 Универсальный анализ файлов снимков (RAW / XML / EXIF):**
-   * **Sony (.ARW, .JPG):** считывание точного количества срабатываний механических шторок из MakerNotes (тег `0x9050`). Снимки с электронным затвором не учитываются в износе шторок.
-   * **Nikon (.NEF, .JPG):** считывание кумулятивного счётчика всех спусков камеры (тег `0x00A7`).
-   * **Canon (.CR3):** прямое извлечение счётчика спусков из контейнера ISOBMFF (`Track4:ShutterCount`) для камер линейки DIGIC X (R5, R6 Mark II, R6 Mark III, R7, R8, R10 и др.).
-   * **Canon (.XML):** детальный разбор официального сервисного отчёта `CAM_INFO.XML` заводской процедуры `CamInfo_Debug`.
-   * **DNG, Fujifilm, Panasonic, Olympus, JPEG:** чтение стандартных EXIF тегов.
-   * **Расчёт износа:** автоматическое сопоставление с паспортным ресурсом шторок производителя.
-   * **Экспорт отчётов:** копирование в один клик и сохранение подробного текстового отчёта (`.txt`).
+## Build and run
 
-2. **💳 Подготовка сервисной SD-карты Canon (`CamInfo_Debug`):**
-   * Форматирование карты памяти ≤32 ГБ в FAT32 в 1 клик.
-   * Запись загрузочной метки `SCRIPT` в нулевой сектор карты (по спецификации CHDK).
-   * Автоматическое создание служебных файлов `extend.m` и `script.req`.
-   * Пошаговые подсказки по запуску диагностического меню в камере.
+Requires a stable Rust toolchain (Windows).
 
-3. **📘 Интерактивная памятка покупателя:**
-   * Отличия механического, электронного и EFCS затворов.
-   * Как правильно проверять камеру при покупке с рук на Авито.
-   * Расшифровка критических сервисных ошибок Canon (Err 20, Err 30, Err 60, Err 70).
-
----
-
-## Запуск
-
-### Windows
-```cmd
-python openeos.py
+```
+cargo build --release
+target\release\openeos.exe
 ```
 
-### macOS (Apple Silicon M1 Pro / Intel)
-```bash
-./run_mac.sh
-```
-*(При необходимости установите поддержку Tkinter: `brew install python-tk`)*
+A prebuilt binary is in `dist\openeos.exe`.
 
----
+## License
 
-## Лицензия
-MIT License. Полностью открытый и безопасный исходный код.
+MIT - see [LICENSE](LICENSE).
