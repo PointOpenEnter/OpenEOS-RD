@@ -57,6 +57,18 @@ pub static CANON_REGISTRY: &[CanonCameraMeta] = &[
         verified_for_live_counters: true,
     },
     CanonCameraMeta {
+        name: "Canon EOS R6 Mark III",
+        short_tag: "R6m3",
+        pid_hex: "3323",
+        camera_type: CameraType::Mirrorless,
+        generation: DigicGeneration::DigicX,
+        shutter_rating: 500_000, // оценка; Canon не публикует, источники расходятся (300–500k)
+        rating_official: false,
+        has_mechanical_shutter: true,
+        cbasic_sd_support: false, // Заблокировано в DIGIC X
+        verified_for_live_counters: false,
+    },
+    CanonCameraMeta {
         name: "Canon EOS R10",
         short_tag: "R10",
         pid_hex: "32F8",
