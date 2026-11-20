@@ -1,6 +1,6 @@
 //! Sony ARW (TIFF-based) RAW parser.
 //!
-//! Extracts Sony Model, Body Serial Number, Date, and Shutter Count (MakerNote Tag 0x9050).
+//! Extracts Sony Model, Body Serial Number, Date, and Shutter Count (MakerNote Tag 36944)).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -109,7 +109,7 @@ fn walk_arw<E: byteorder::ByteOrder>(file: &mut File, result: &mut RawAnalysisRe
                 let val_count = file.read_u32::<E>().unwrap_or(0);
                 let val_or_offset = file.read_u32::<E>().unwrap_or(0);
 
-                if tag == 0x9050 /* Sony MakerNote tag (public EXIF) */ && tag_type == 7 && val_count >= 0x40 {
+                if tag == 36944 /* Sony shutter-count tag */ && tag_type == 7 && val_count >= 0x40 {
                     // Tag9050 — зашифрованный блок (UNDEFINED). Значение всегда по указателю.
                     let cur_pos = file.stream_position().unwrap_or(0);
                     if file.seek(SeekFrom::Start(val_or_offset as u64)).is_ok() {
@@ -118,14 +118,27 @@ fn walk_arw<E: byteorder::ByteOrder>(file: &mut File, result: &mut RawAnalysisRe
                         if file.read_exact(&mut blob).is_ok() {
                             sony_decipher(&mut blob);
                             let model = result.camera_model.clone().unwrap_or_default();
-                            let (off, layout) = if is_tag9050a_model(&model) { (0x32, "9050a") } else { (0x3A, "9050b/c") };
-                            if let Some(cnt) = read_u24_le(&blob, off) {
-                                if cnt > 0 && cnt < 5_000_000 {
-                                    result.shutter_count = Some(cnt);
-                                    result.notes.push(format!(
-                                        "Sony: счётчик из расшифрованного блока Tag{layout}, смещение 0x{off:02X}. \
-                                         Раскладка выбрана по модели; сверьте с ExifTool на эталонном файле этой модели."
-                                    ));
+                            // Как raw_engine._decode_sony_block: у новых моделей счётчик по 0x0A,
+                            // затем 0x3A (либо 0x32 для старой раскладки 9050a), затем 0x50.
+                            let m = model.to_uppercase();
+                            let mut cands: Vec<(usize, &str)> = Vec::new();
+                            if ["7M5", "6700", "7CM2", "7CR", "1M2"].iter().any(|k| m.contains(k)) {
+                                cands.push((0x0A, "9050 (новая раскладка)"));
+                            }
+                            if is_tag9050a_model(&model) {
+                                cands.push((0x32, "9050a"));
+                            }
+                            cands.push((0x3A, "9050b/c"));
+                            cands.push((0x50, "9050 (альт.)"));
+                            for (off, layout) in cands {
+                                if let Some(cnt) = read_u24_le(&blob, off) {
+                                    if cnt > 0 && cnt < 5_000_000 {
+                                        result.shutter_count = Some(cnt);
+                                        result.notes.push(format!(
+                                            "Sony: счётчик из расшифрованного блока Tag{layout}, смещение 0x{off:02X}.                                              Раскладка выбрана по модели; сверьте с ExifTool на эталонном файле этой модели."
+                                        ));
+                                        break;
+                                    }
                                 }
                             }
                         }

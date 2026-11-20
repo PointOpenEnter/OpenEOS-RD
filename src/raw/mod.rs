@@ -250,7 +250,7 @@ pub fn generate_raw_report_text(res: &RawAnalysisResult) -> String {
     }
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "Сформировано в:       OpenEOS PRO v1.0 (Native Monolith Core)");
+    let _ = writeln!(out, "Сформировано в:       OpenEOS v1.0.3");
     let _ = writeln!(out, "========================================================================");
 
     out

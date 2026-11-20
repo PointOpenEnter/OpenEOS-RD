@@ -1,4 +1,6 @@
-//! OpenEOS v1.0 — RAW / EXIF analyzer and SD card maker.
+//! OpenEOS v1.0 — Public Community Edition (2 Tabs: RAW / EXIF & SD-Card Maker).
+//!
+//! Clean public edition for distribution (RAW metadata analysis & SD card preparation).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -15,7 +17,7 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("OpenEOS — RAW & SD Inspector")
+            .with_title("OpenEOS Community Edition — RAW & SD Inspector")
             .with_inner_size([980.0, 700.0])
             .with_min_inner_size([980.0, 700.0])
             .with_max_inner_size([980.0, 700.0])
@@ -27,7 +29,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "OpenEOS",
+        "OpenEOS Public",
         native_options,
         Box::new(|cc| Ok(Box::new(OpenEosApp::new(cc)))),
     )

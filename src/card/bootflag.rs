@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CamErrorItem {
     pub code: String,
-    pub count: u32,
+    /// None when <Count> is missing/malformed (never invented).
+    pub count: Option<u32>,
     pub description: String,
 }
 
@@ -230,61 +231,90 @@ impl BootflagManager {
         }
     }
 
-    /// Write Canon Basic diagnostic scripts (extend.m + script.req)
+    /// Записывает файл, сбрасывает на носитель (sync_all) и перечитывает: содержимое должно совпасть.
+    fn write_and_verify(path: &Path, content: &[u8]) -> Result<(), String> {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let mut f = File::create(path).map_err(|e| format!("Не удалось создать {name}: {e}"))?;
+        f.write_all(content).map_err(|e| format!("Не удалось записать {name}: {e}"))?;
+        f.sync_all().map_err(|e| format!("Не удалось сбросить {name} на карту (sync): {e}"))?;
+        drop(f);
+        let back = std::fs::read(path).map_err(|e| format!("Не удалось перечитать {name}: {e}"))?;
+        if back != content {
+            return Err(format!("Проверка чтения {name} не удалась: записанное содержимое не совпало."));
+        }
+        Ok(())
+    }
+
+    /// Write Canon Basic diagnostic scripts (extend.m + script.req), with sync and read-back verification.
     pub fn write_canon_basic_scripts<P: AsRef<Path>>(card_root: P) -> Result<(), String> {
         let root = card_root.as_ref();
         if !root.exists() {
             return Err("Указанный путь к карте памяти не существует".to_string());
         }
 
-        // 1. Write script.req trigger for Canon bootloader
-        let req_path = root.join("script.req");
-        let mut req_file = File::create(&req_path)
-            .map_err(|e| format!("Не удалось создать script.req: {e}"))?;
-        req_file
-            .write_all(b"for DC_scriptdisk\n")
-            .map_err(|e| format!("Не удалось записать script.req: {e}"))?;
+        // 1. script.req trigger for Canon Basic bootloader
+        Self::write_and_verify(&root.join("script.req"), b"for DC_scriptdisk
+")?;
 
-        // 2. Write extend.m script with CamInfo_Debug(1) payload
-        let extend_path = root.join("extend.m");
-        let mut ext_file = File::create(&extend_path)
-            .map_err(|e| format!("Не удалось создать extend.m: {e}"))?;
-        let script_payload = "private sub Initialize()\nSystem.Create()\nCamInfo_Debug(1)\nend sub\n";
-        ext_file
-            .write_all(script_payload.as_bytes())
-            .map_err(|e| format!("Не удалось записать extend.m: {e}"))?;
+        // 2. extend.m script with CamInfo_Debug(1) payload
+        let script_payload = "private sub Initialize()
+System.Create()
+CamInfo_Debug(1)
+end sub
+";
+        Self::write_and_verify(&root.join("extend.m"), script_payload.as_bytes())?;
 
         Ok(())
     }
 
-    /// Full preparation: format FAT32, write SCRIPT marker, copy extend.m + script.req
+    /// Full preparation: format FAT32, write SCRIPT marker, copy extend.m + script.req.
+    /// Любой сбой (в том числе записи маркера в сектор 0) возвращает Err: карта НЕ загрузочная.
     pub fn prepare_full_card(drive_letter: char, format_first: bool) -> Result<String, String> {
         let drive_root = format!("{}:\\", drive_letter);
+        Self::prepare_card_steps(
+            Path::new(&drive_root),
+            format_first,
+            || Self::format_card_fat32(drive_letter, "OPENEOS"),
+            || Self::write_script_marker(drive_letter),
+        )
+    }
 
+    /// Логика подготовки карты с внедряемыми шагами (для тестов без физического носителя).
+    pub fn prepare_card_steps<F, M>(
+        drive_root: &Path,
+        format_first: bool,
+        format_step: F,
+        marker_step: M,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<String, String>,
+        M: FnOnce() -> Result<String, String>,
+    {
         let mut log_messages = Vec::new();
 
         if format_first {
-            match Self::format_card_fat32(drive_letter, "OPENEOS") {
+            match format_step() {
                 Ok(msg) => log_messages.push(msg),
                 Err(e) => return Err(format!("Ошибка форматирования: {e}")),
             }
         }
 
-        // Write boot marker
-        match Self::write_script_marker(drive_letter) {
+        match marker_step() {
             Ok(msg) => log_messages.push(msg),
             Err(e) => {
-                log_messages.push(format!("Внимание (сектор 0): {e}"));
+                return Err(format!(
+                    "Карта НЕ загрузочная: не удалось записать маркер SCRIPT в сектор 0: {e}"
+                ));
             }
         }
 
-        // Write files
-        match Self::write_canon_basic_scripts(&drive_root) {
-            Ok(()) => log_messages.push("Скрипты extend.m и script.req успешно записаны на карту.".to_string()),
+        match Self::write_canon_basic_scripts(drive_root) {
+            Ok(()) => log_messages.push("Скрипты extend.m и script.req записаны и проверены чтением.".to_string()),
             Err(e) => return Err(format!("Ошибка записи скриптов: {e}")),
         }
 
-        Ok(log_messages.join("\n"))
+        Ok(log_messages.join("
+"))
     }
 
     /// Check if CAM_INFO.XML exists on the card and parse it
@@ -301,14 +331,50 @@ impl BootflagManager {
         None
     }
 
-    /// Parse CAM_INFO.XML dump generated by Canon Basic
+    /// Parse CAM_INFO.XML diagnostic dump generated by Canon Basic
+    /// (mirrors Python `parse_cam_info_xml`: size limit 4 MiB, 0 bytes rejected).
     pub fn parse_cam_info_xml(path: &Path) -> Result<CamInfoReport, String> {
+        const MAX_CAM_INFO_XML_BYTES: u64 = 4 * 1024 * 1024;
         let mut file = File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
-        let mut content = String::new();
-        file.read_to_string(&mut content).map_err(|e| format!("Cannot read XML: {e}"))?;
+        let size = file.metadata().map_err(|e| format!("Cannot stat XML: {e}"))?.len();
+        if size == 0 || size > MAX_CAM_INFO_XML_BYTES {
+            return Err(format!("Invalid XML size: {size} bytes"));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| format!("Cannot read XML: {e}"))?;
+        let content = Self::decode_xml_bytes(&bytes);
+        Self::parse_cam_info_str(&content, &path.to_string_lossy())
+    }
 
+    /// Decode bytes tolerantly (UTF-8 / UTF-16 BOM); never fails on odd encodings.
+    fn decode_xml_bytes(bytes: &[u8]) -> String {
+        let utf16 = |b: &[u8], le: bool| {
+            let units: Vec<u16> = b
+                .chunks_exact(2)
+                .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+                .collect();
+            String::from_utf16_lossy(&units)
+        };
+        if bytes.starts_with(&[0xFF, 0xFE]) {
+            utf16(&bytes[2..], true)
+        } else if bytes.starts_with(&[0xFE, 0xFF]) {
+            utf16(&bytes[2..], false)
+        } else {
+            let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
+            String::from_utf8_lossy(b).into_owned()
+        }
+    }
+
+    /// Parse CAM_INFO.XML text. Field names and fallbacks match the Python reference.
+    pub fn parse_cam_info_str(content: &str, file_path: &str) -> Result<CamInfoReport, String> {
+        let content = content.to_string();
+        // Python as_int: ASCII digits only, otherwise None.
+        let as_int = |v: Option<String>| -> Option<u32> {
+            v.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse::<u32>().ok())
+        };
         let mut report = CamInfoReport {
-            file_path: path.to_string_lossy().to_string(),
+            file_path: file_path.to_string(),
             ..Default::default()
         };
 
@@ -334,30 +400,35 @@ impl BootflagManager {
         report.firmware = get_tag_value(&content, "Firmware")
             .or_else(|| get_tag_value(&content, "FirmwareVer"));
 
-        if let Some(val) = get_tag_value(&content, "TotalShutter").or_else(|| get_tag_value(&content, "ShutterCount")) {
-            report.total_shutter = val.parse::<u32>().ok();
-        }
-
-        if let Some(val) = get_tag_value(&content, "TotalShoot").or_else(|| get_tag_value(&content, "ReleaseCount")) {
-            report.total_shoot = val.parse::<u32>().ok();
-        }
-
-        if let Some(val) = get_tag_value(&content, "PowerOnCount") {
-            report.power_on_count = val.parse::<u32>().ok();
-        }
+        report.total_shutter = as_int(get_tag_value(&content, "TotalShutter").or_else(|| get_tag_value(&content, "ShutterCount")));
+        report.total_shoot = as_int(get_tag_value(&content, "TotalShoot").or_else(|| get_tag_value(&content, "ReleaseCount")));
+        report.power_on_count = as_int(get_tag_value(&content, "PowerOnCount"));
 
         report.total_running_time = get_tag_value(&content, "TotalRunningTime");
 
-        // Parse ErrorList
+        // Parse ErrorList. The code->meaning table is NOT grounded in a real CAM_INFO.XML
+        // dump (copied from the Python reference), so meanings are shown only as hedged hints.
         let known_errors = [
-            ("E01", "Ошибка связи с объективом (проверьте контакты байонета)"),
-            ("E02", "Ошибка связи с картой памяти"),
-            ("E04", "Ошибка чтения/записи буфера"),
-            ("E20", "Механический сбой (привод зеркала, взвод или шторки затвора)"),
-            ("E30", "Непосредственный сбой узла затвора (тайминг шторок)"),
-            ("E60", "Сбой привода диафрагмы или вспомогательного мотора"),
-            ("E70", "Системный сбой встроенного ПО или оперативной памяти"),
+            ("E01", "lens communication"),
+            ("E02", "memory card communication"),
+            ("E04", "buffer read/write"),
+            ("E20", "mechanical (mirror/shutter drive)"),
+            ("E30", "shutter unit timing"),
+            ("E60", "aperture / auxiliary motor"),
+            ("E70", "firmware / RAM"),
         ];
+        // Only <Kind> entries inside <ErrorList>, like Python `.//ErrorList/Kind`.
+        let error_block: String = match content.find("<ErrorList>") {
+            Some(s0) => {
+                let rest = &content[s0..];
+                match rest.find("</ErrorList>") {
+                    Some(e0) => rest[..e0].to_string(),
+                    None => rest.to_string(),
+                }
+            }
+            None => String::new(),
+        };
+        let content = error_block;
 
         let mut search_idx = 0;
         while let Some(kind_start) = content[search_idx..].find("<Kind>") {
@@ -370,14 +441,14 @@ impl BootflagManager {
 
             let code = get_tag_value(kind_block, "ID");
             let count_str = get_tag_value(kind_block, "Count");
-            let count = count_str.and_then(|c| c.parse::<u32>().ok()).unwrap_or(1);
+            let count = as_int(count_str);
 
             if let Some(cd) = code {
                 let desc = known_errors
                     .iter()
                     .find(|(k, _)| *k == cd.as_str())
-                    .map(|(_, desc)| desc.to_string())
-                    .unwrap_or_else(|| "Сервисное событие камеры".to_string());
+                    .map(|(_, desc)| format!("возможно: {desc} (значение не подтверждено)"))
+                    .unwrap_or_else(|| "Сервисное событие (код не расшифрован)".to_string());
 
                 report.errors.push(CamErrorItem {
                     code: cd,
@@ -498,6 +569,6 @@ mod tests {
         assert_eq!(res.power_on_count, Some(1200));
         assert_eq!(res.errors.len(), 1);
         assert_eq!(res.errors[0].code, "E20");
-        assert_eq!(res.errors[0].count, 2);
+        assert_eq!(res.errors[0].count, Some(2));
     }
 }

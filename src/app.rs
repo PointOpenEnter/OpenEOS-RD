@@ -315,13 +315,24 @@ impl OpenEosApp {
                                 ui.end_row();
 
                                 if res.has_mechanical_shutter {
+                                    let rating_official = res
+                                        .camera_model
+                                        .as_deref()
+                                        .and_then(crate::models::find_by_name)
+                                        .map(|m| m.rating_official)
+                                        .unwrap_or(false);
                                     if let Some(r) = res.shutter_rating {
-                                        ui.label(egui::RichText::new("Паспортный ресурс:").color(egui::Color32::from_rgb(170, 185, 205)));
-                                        ui.add(egui::Label::new(format!("{r} срабатываний")).selectable(true));
+                                        if rating_official {
+                                            ui.label(egui::RichText::new("Паспортный ресурс:").color(egui::Color32::from_rgb(170, 185, 205)));
+                                            ui.add(egui::Label::new(format!("{r} срабатываний")).selectable(true));
+                                        } else {
+                                            ui.label(egui::RichText::new("Ресурс (оценка):").color(egui::Color32::from_rgb(170, 185, 205)));
+                                            ui.add(egui::Label::new(format!("{r} срабатываний (оценка), износ: ресурс не подтверждён")).selectable(true));
+                                        }
                                         ui.end_row();
                                     }
 
-                                    if let Some(w) = res.wear_percentage {
+                                    if let (true, Some(w)) = (rating_official, res.wear_percentage) {
                                         ui.label(egui::RichText::new("Износ механизма:").color(egui::Color32::from_rgb(170, 185, 205)));
                                         ui.horizontal_wrapped(|ui| {
                                             let ratio = (w / 100.0).clamp(0.0, 1.0);
@@ -618,7 +629,8 @@ impl OpenEosApp {
                                         ui.label(egui::RichText::new("Аппаратных ошибок не зафиксировано (камера полностью исправна)").color(egui::Color32::GREEN));
                                     } else {
                                         for err in &report.errors {
-                                            ui.label(format!("• Ошибка {}: {} (кол-во: {})", err.code, err.description, err.count));
+                                            let cnt = err.count.map(|c| c.to_string()).unwrap_or_else(|| "—".to_string());
+                                            ui.label(format!("• Код {}: {} (кол-во: {})", err.code, err.description, cnt));
                                         }
                                     }
                                 });

@@ -1,6 +1,6 @@
 [package]
 name = "openeos"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 authors = ["OpenEOS Team"]
 description = "Shutter-count analyzer for RAW/JPEG files with SD card preparation"
